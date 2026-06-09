@@ -12,7 +12,7 @@ A production-grade Retrieval-Augmented Generation (RAG) system with two coordina
 Documents / Websites / APIs
            │
            ▼
-    Extraction / OCR
+    Extraction / OCR (Optical Character Recognition for image-based documents) 
            │
            ▼
   Cleaning + Metadata
@@ -24,7 +24,7 @@ Documents / Websites / APIs
         Kafka
            │
            ▼
-  Embedding Workers
+  Embedding Workers     
            │
            ▼
       Vector DB
@@ -127,7 +127,7 @@ pytest tests/ -v
 ---
 
 ## Key Technologies
-
+x
 | Component | Technology |
 |---|---|
 | Message queue | Apache Kafka |

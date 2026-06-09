@@ -16,19 +16,52 @@ logger = logging.getLogger(__name__)
 
 
 def embed_text(text: str) -> list[float]:
-    """Embed *text* using the configured OpenAI embedding model.
+    """Embed *text* using the configured embedding provider.
 
-    This is a module-level convenience used by the gateway and tests.
+    Respects ``settings.embedding_provider``:
+    - ``"sentence-transformers"`` — local, no API key required (default)
+    - ``"openai"``  — requires ``OPENAI_API_KEY``
+    - ``"cohere"``  — requires ``COHERE_API_KEY``
+    - ``"gemini"``  — requires ``GEMINI_API_KEY``
     """
     from config.settings import settings
-    from openai import OpenAI
 
-    client = OpenAI()
-    response = client.embeddings.create(
-        model=settings.embedding_model,
-        input=text,
-    )
-    return response.data[0].embedding
+    provider = settings.embedding_provider
+
+    if provider == "openai":
+        from openai import OpenAI
+        client = OpenAI(api_key=settings.openai_api_key)
+        response = client.embeddings.create(
+            model=settings.embedding_model,
+            input=text,
+        )
+        return response.data[0].embedding
+
+    if provider == "cohere":
+        import cohere
+        client = cohere.ClientV2(api_key=settings.cohere_api_key)
+        response = client.embed(
+            texts=[text],
+            model=settings.embedding_model,
+            input_type="search_query",
+            embedding_types=["float"],
+        )
+        return response.embeddings.float[0]
+
+    if provider == "gemini":
+        import google.generativeai as genai
+        genai.configure(api_key=settings.gemini_api_key)
+        response = genai.embed_content(
+            model=f"models/{settings.embedding_model}",
+            content=text,
+            task_type="retrieval_query",
+        )
+        return response["embedding"]
+
+    # Default: sentence-transformers (local, free)
+    from sentence_transformers import SentenceTransformer
+    _model = SentenceTransformer(settings.embedding_model)
+    return _model.encode(text, show_progress_bar=False).tolist()
 
 
 class EmbeddingCache:

@@ -13,10 +13,17 @@ class Settings(BaseSettings):
     # ── LLM ─────────────────────────────────────────────────────────────────
     openai_api_key: str = ""
     anthropic_api_key: str = ""
+    # Free alternatives
+    groq_api_key: str = ""          # https://console.groq.com
+    gemini_api_key: str = ""         # https://aistudio.google.com
+    cohere_api_key: str = ""         # https://dashboard.cohere.com
+    mistral_api_key: str = ""        # https://console.mistral.ai
 
     # ── Embeddings ───────────────────────────────────────────────────────────
-    embedding_model: str = "text-embedding-3-small"
-    embedding_dimension: int = 1536
+    # provider: "sentence-transformers" (local/free) | "openai" | "cohere" | "gemini"
+    embedding_provider: str = "sentence-transformers"
+    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_dimension: int = 384
 
     # ── Kafka ────────────────────────────────────────────────────────────────
     kafka_bootstrap_servers: str = "localhost:9092"

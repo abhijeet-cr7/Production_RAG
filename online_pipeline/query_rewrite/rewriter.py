@@ -25,7 +25,7 @@ class QueryRewriter:
     no API key is configured.
     """
 
-    def __init__(self, model: str = "gpt-4o-mini") -> None:
+    def __init__(self, model: str = "llama-3.1-8b-instant") -> None:
         self.model = model
 
     def rewrite(self, query: str) -> str:
@@ -44,9 +44,10 @@ class QueryRewriter:
             return query
 
     def _call_llm(self, query: str) -> str:
-        from openai import OpenAI
+        from groq import Groq
+        from config.settings import settings
 
-        client = OpenAI()
+        client = Groq(api_key=settings.groq_api_key)
         response = client.chat.completions.create(
             model=self.model,
             messages=[

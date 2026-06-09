@@ -8,12 +8,18 @@ python-dotenv>=1.0.0
 # ── LLM clients ─────────────────────────────────────────────────────────────
 openai>=1.25.0
 anthropic>=0.25.0
+# Free alternatives
+groq>=0.9.0
+google-generativeai>=0.7.0
+cohere>=5.5.0
+mistralai>=1.0.0
 
 # ── Embeddings ───────────────────────────────────────────────────────────────
 sentence-transformers>=2.7.0
 
 # ── Vector DB ───────────────────────────────────────────────────────────────
-qdrant-client>=1.9.0
+# Pinned to match Qdrant server v1.9.x (docker-compose image: qdrant/qdrant:v1.9.2)
+qdrant-client>=1.9.0,<1.10.0
 
 # ── BM25 ────────────────────────────────────────────────────────────────────
 rank-bm25>=0.2.2
