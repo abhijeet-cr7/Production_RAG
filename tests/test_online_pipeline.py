@@ -43,6 +43,38 @@ class TestEmbeddingCache:
         assert cache.get("q") is None
         cache.set("q", [1.0])  # no-op
 
+    def test_key_is_namespaced_by_model_id(self):
+        redis_mock = MagicMock()
+        with patch("online_pipeline.cache.embedding_cache.EmbeddingCache._connect", return_value=redis_mock):
+            from online_pipeline.cache.embedding_cache import EmbeddingCache
+
+            cache_a = EmbeddingCache(
+                redis_url="redis://localhost:6379/0",
+                model_id="sentence-transformers:all-MiniLM-L6-v2",
+            )
+            cache_b = EmbeddingCache(
+                redis_url="redis://localhost:6379/0",
+                model_id="openai:text-embedding-3-small",
+            )
+
+        key_a = cache_a._make_key("same query")
+        key_b = cache_b._make_key("same query")
+        assert key_a != key_b
+
+    def test_set_uses_namespaced_key(self):
+        redis_mock = MagicMock()
+        with patch("online_pipeline.cache.embedding_cache.EmbeddingCache._connect", return_value=redis_mock):
+            from online_pipeline.cache.embedding_cache import EmbeddingCache
+
+            cache = EmbeddingCache(
+                redis_url="redis://localhost:6379/0",
+                model_id="provider:model-x",
+            )
+
+        cache.set("hello", [1.0, 2.0])
+        setex_args = redis_mock.setex.call_args.args
+        assert setex_args[0].startswith("emb:provider:model-x:")
+
 
 # ── BM25Retriever ─────────────────────────────────────────────────────────────
 
@@ -157,3 +189,34 @@ class TestHybridRetriever:
         fused = retriever._rrf_fuse([shared, bm25_only], [shared], top_k=5)
         scores = {r["metadata"]["doc_id"]: r["hybrid_score"] for r in fused}
         assert scores["s"] > scores["b"]
+
+
+# ── LLMRouter ────────────────────────────────────────────────────────────────
+
+class TestLLMRouter:
+    def test_generate_answer_uses_primary_provider(self):
+        from online_pipeline.llm.router import LLMRouter
+
+        with patch("online_pipeline.llm.router.LLMClient") as client_cls:
+            client_cls.return_value.generate.return_value = "answer"
+            router = LLMRouter(fallback_providers="gemini")
+
+            result = router.generate_answer(query="q", context="ctx")
+
+        assert result == "answer"
+        assert client_cls.call_args.kwargs["provider"] == "groq"
+
+    def test_generate_answer_falls_back_to_next_provider(self):
+        from online_pipeline.llm.router import LLMRouter
+
+        primary = MagicMock()
+        primary.generate.side_effect = RuntimeError("primary failed")
+        fallback = MagicMock()
+        fallback.generate.return_value = "fallback answer"
+
+        with patch("online_pipeline.llm.router.LLMClient", side_effect=[primary, fallback]) as client_cls:
+            router = LLMRouter(fallback_providers="gemini")
+            result = router.generate_answer(query="q", context="ctx")
+
+        assert result == "fallback answer"
+        assert client_cls.call_args_list[1].kwargs["provider"] == "gemini"

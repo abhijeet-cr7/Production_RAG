@@ -12,14 +12,13 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from offline_pipeline.chunkers.text_chunker import TextChunker
+from offline_pipeline.chunkers.router import ChunkingStrategyRouter
 from offline_pipeline.extractors.document_extractor import DocumentExtractor
 from offline_pipeline.preprocessors.cleaner import TextCleaner
 from offline_pipeline.preprocessors.metadata_extractor import MetadataExtractor
 from online_pipeline.cache.embedding_cache import EmbeddingCache, embed_text
 from online_pipeline.context_builder.builder import ContextBuilder
-from online_pipeline.llm.llm_client import LLMClient
-from online_pipeline.query_rewrite.rewriter import QueryRewriter
+from online_pipeline.llm.router import LLMRouter
 from online_pipeline.reranker.reranker import Reranker
 from online_pipeline.retrieval.hybrid_retriever import HybridRetriever
 from vector_db.client import VectorDBClient
@@ -50,26 +49,24 @@ class IngestResponse(BaseModel):
 
 # ── Dependency singletons (initialised at startup) ───────────────────────────
 
-_rewriter: QueryRewriter | None = None
+_llm_router: LLMRouter | None = None
 _cache: EmbeddingCache | None = None
 _retriever: HybridRetriever | None = None
 _reranker: Reranker | None = None
 _context_builder: ContextBuilder | None = None
-_llm: LLMClient | None = None
 _vector_db: VectorDBClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-    global _rewriter, _cache, _retriever, _reranker, _context_builder, _llm, _vector_db
+    global _llm_router, _cache, _retriever, _reranker, _context_builder, _vector_db
     _vector_db = VectorDBClient()
     _vector_db.ensure_collection()
-    _rewriter = QueryRewriter()
+    _llm_router = LLMRouter()
     _cache = EmbeddingCache(redis_url=settings.redis_url)
     _retriever = HybridRetriever(vector_db=_vector_db)
     _reranker = Reranker()
     _context_builder = ContextBuilder()
-    _llm = LLMClient()
     yield
 
 
@@ -120,7 +117,8 @@ async def ingest(file: UploadFile = File(...)) -> IngestResponse:
         doc = MetadataExtractor().enrich(doc)
 
         # 4. Chunk
-        chunker = TextChunker(
+        chunker = ChunkingStrategyRouter(
+            strategy=settings.chunking_strategy,
             chunk_size=settings.chunk_size,
             chunk_overlap=settings.chunk_overlap,
         )
@@ -162,7 +160,7 @@ async def query(request: QueryRequest) -> QueryResponse:
         raise HTTPException(status_code=400, detail="Query must not be empty.")
 
     # 1. Query rewrite
-    rewritten = _rewriter.rewrite(request.query)
+    rewritten = _llm_router.rewrite_query(request.query)
 
     # 2. Embedding with cache
     embedding = _cache.get(rewritten)
@@ -186,7 +184,7 @@ async def query(request: QueryRequest) -> QueryResponse:
     context = _context_builder.build(reranked)
 
     # 6. LLM generation
-    answer = _llm.generate(
+    answer = _llm_router.generate_answer(
         query=request.query,
         context=context,
         chat_history=request.chat_history,

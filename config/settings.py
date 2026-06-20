@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""         # https://aistudio.google.com
     cohere_api_key: str = ""         # https://dashboard.cohere.com
     mistral_api_key: str = ""        # https://console.mistral.ai
+    llm_routing_mode: str = "balanced"  # "cost_optimized" | "balanced" | "quality"
+    query_rewrite_provider: str = "groq"
+    query_rewrite_model: str = "llama-3.1-8b-instant"
+    answer_generation_provider: str = "groq"
+    answer_generation_model: str = ""
+    llm_fallback_providers: str = "gemini,openai,anthropic"
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     # provider: "sentence-transformers" (local/free) | "openai" | "cohere" | "gemini"
@@ -50,6 +56,7 @@ class Settings(BaseSettings):
     vector_weight: float = 0.7
 
     # ── Chunking ─────────────────────────────────────────────────────────────
+    chunking_strategy: str = "auto"  # "auto" | "fixed_token" | "recursive"
     chunk_size: int = 512
     chunk_overlap: int = 64
 

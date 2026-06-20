@@ -103,3 +103,31 @@ class TestTextChunker:
         from offline_pipeline.chunkers.text_chunker import TextChunker
         with pytest.raises(ValueError):
             TextChunker(chunk_size=10, chunk_overlap=10)
+
+
+# ── ChunkingStrategyRouter ───────────────────────────────────────────────────
+
+class TestChunkingStrategyRouter:
+    def test_auto_selects_recursive_for_structured_text(self):
+        from offline_pipeline.chunkers.router import ChunkingStrategyRouter
+
+        router = ChunkingStrategyRouter(strategy="auto", chunk_size=10, chunk_overlap=2)
+        selected = router.select_strategy("Heading\n\nA paragraph", metadata={"file_type": "txt"})
+
+        assert selected == "recursive"
+
+    def test_auto_falls_back_to_fixed_token_for_flat_text(self):
+        from offline_pipeline.chunkers.router import ChunkingStrategyRouter
+
+        router = ChunkingStrategyRouter(strategy="auto", chunk_size=10, chunk_overlap=2)
+        selected = router.select_strategy("one two three four", metadata={"file_type": "txt"})
+
+        assert selected == "fixed_token"
+
+    def test_router_adds_strategy_metadata(self):
+        from offline_pipeline.chunkers.router import ChunkingStrategyRouter
+
+        router = ChunkingStrategyRouter(strategy="fixed_token", chunk_size=3, chunk_overlap=1)
+        chunks = router.chunk("one two three four five", metadata={"source": "test.txt"})
+
+        assert chunks[0]["metadata"]["chunking_strategy"] == "fixed_token"
