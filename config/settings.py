@@ -60,5 +60,21 @@ class Settings(BaseSettings):
     chunk_size: int = 512
     chunk_overlap: int = 64
 
+    # ── Web search (Tavily) ──────────────────────────────────────────────────
+    tavily_api_key: str = ""          # https://app.tavily.com
+    web_search_enabled: bool = True   # allow falling back to the web
+    web_search_max_results: int = 5
+    # Local hits below this count trigger a web-search top-up.
+    web_search_min_local_results: int = 3
+    # Cross-encoder logit below which the best local hit counts as irrelevant.
+    web_search_min_relevance_score: float = 0.0
+    tavily_search_depth: str = "basic"  # "basic" | "advanced"
+
+    # ── Observability (LangSmith) ────────────────────────────────────────────
+    langsmith_tracing: bool = False
+    langsmith_api_key: str = ""       # https://smith.langchain.com
+    langsmith_project: str = "production-rag"
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
+
 
 settings = Settings()

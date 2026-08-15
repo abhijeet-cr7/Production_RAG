@@ -146,6 +146,38 @@ body {
 .file-name { font-weight: 500; font-size: 14px; }
 .file-size { color: var(--text-muted); font-size: 13px; }
 
+/* ── File list (multi-upload) ── */
+.file-list { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.file-list-item {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 8px 12px;
+}
+.file-list-item .file-icon { font-size: 18px; }
+.file-list-item .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-remove {
+  background: none; border: none; color: var(--text-muted);
+  cursor: pointer; font-size: 13px; padding: 2px 6px; border-radius: 4px;
+}
+.file-remove:hover { color: var(--error); background: var(--error-dim); }
+
+/* ── URL ingest ── */
+.url-ingest { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--border); padding-top: 16px; }
+.section-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--text-muted); font-weight: 600;
+}
+.url-row { display: flex; gap: 8px; }
+.url-input {
+  flex: 1; background: var(--bg-card);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); font-family: var(--font); font-size: 14px;
+  padding: 10px 12px; outline: none; transition: border-color 0.2s;
+}
+.url-input:focus { border-color: var(--accent); }
+.url-input::placeholder { color: var(--text-muted); }
+.url-input:disabled { opacity: 0.5; }
+
 /* ── Buttons ── */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;
@@ -270,6 +302,18 @@ code.truncate {
   color: var(--text-muted);
   font-size: 13px;
 }
+
+.chat-notice {
+  align-self: center;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  padding: 4px 12px;
+}
+
+.query-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 .query-input {
   width: 100%; background: var(--bg-card);

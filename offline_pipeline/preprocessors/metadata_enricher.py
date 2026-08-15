@@ -1,4 +1,4 @@
-"""Metadata extractor: enriches document metadata with derived fields."""
+"""Metadata enricher: derives and attaches document metadata fields."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-class MetadataExtractor:
+class MetadataEnricher:
     """Derive and attach additional metadata to a document dict."""
 
     def enrich(self, document: dict[str, Any]) -> dict[str, Any]:

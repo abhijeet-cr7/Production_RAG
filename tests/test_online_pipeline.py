@@ -220,3 +220,135 @@ class TestLLMRouter:
 
         assert result == "fallback answer"
         assert client_cls.call_args_list[1].kwargs["provider"] == "gemini"
+
+
+# ── TavilyWebSearch ──────────────────────────────────────────────────────────
+
+class TestTavilyWebSearch:
+    def _make_search(self, client=None):
+        from online_pipeline.retrieval.web_search import TavilyWebSearch
+        with patch.object(TavilyWebSearch, "_connect", return_value=client):
+            return TavilyWebSearch(api_key="test-key")
+
+    def test_unavailable_without_client(self):
+        search = self._make_search(client=None)
+        assert search.available is False
+        assert search.search("anything") == []
+
+    def test_normalises_results_to_chunk_shape(self):
+        client = MagicMock()
+        client.search.return_value = {
+            "results": [
+                {
+                    "title": "Qdrant docs",
+                    "url": "https://qdrant.tech/docs",
+                    "content": "Qdrant is a vector database.",
+                    "score": 0.91,
+                }
+            ]
+        }
+        results = self._make_search(client).search("what is qdrant")
+
+        assert len(results) == 1
+        assert results[0]["text"] == "Qdrant is a vector database."
+        assert results[0]["metadata"]["source"] == "https://qdrant.tech/docs"
+        assert results[0]["metadata"]["file_type"] == "web_search"
+        assert results[0]["web_score"] == pytest.approx(0.91)
+
+    def test_skips_results_without_content(self):
+        client = MagicMock()
+        client.search.return_value = {"results": [{"url": "https://x.dev", "content": "   "}]}
+        assert self._make_search(client).search("q") == []
+
+    def test_api_failure_degrades_to_empty_list(self):
+        client = MagicMock()
+        client.search.side_effect = RuntimeError("network down")
+        assert self._make_search(client).search("q") == []
+
+    def test_blank_query_skips_api_call(self):
+        client = MagicMock()
+        assert self._make_search(client).search("   ") == []
+        client.search.assert_not_called()
+
+
+# ── LangSmith tracing ────────────────────────────────────────────────────────
+
+class TestTracing:
+    def test_decorator_is_transparent_when_disabled(self):
+        from online_pipeline.observability import tracing
+
+        with patch.object(tracing, "configure_tracing", return_value=False):
+            @tracing.traced(name="unit", run_type="chain")
+            def add(a, b):
+                return a + b
+
+            assert add(2, 3) == 5
+
+    def test_wraps_with_langsmith_when_enabled(self):
+        from online_pipeline.observability import tracing
+
+        def fake_traceable(name=None, run_type=None):
+            def decorator(fn):
+                def wrapped(*args, **kwargs):
+                    return f"traced:{fn(*args, **kwargs)}"
+                return wrapped
+            return decorator
+
+        traceable = MagicMock(side_effect=fake_traceable)
+        with patch.object(tracing, "configure_tracing", return_value=True), \
+             patch.dict("sys.modules", {"langsmith": MagicMock(traceable=traceable)}):
+            @tracing.traced(name="unit", run_type="llm")
+            def echo(value):
+                return value
+
+            assert echo("x") == "traced:x"
+        traceable.assert_called_once_with(name="unit", run_type="llm")
+
+    def test_tracing_disabled_without_api_key(self):
+        from online_pipeline.observability import tracing
+
+        with patch.object(tracing.settings, "langsmith_tracing", True), \
+             patch.object(tracing.settings, "langsmith_api_key", ""):
+            assert tracing.tracing_enabled() is False
+
+
+# ── Web-search trigger ───────────────────────────────────────────────────────
+
+class TestLocalRecallIsWeak:
+    def _docs(self, count, score=None):
+        docs = []
+        for i in range(count):
+            doc = {"text": f"chunk {i}", "metadata": {"doc_id": str(i)}}
+            if score is not None:
+                doc["rerank_score"] = score
+            docs.append(doc)
+        return docs
+
+    def test_thin_recall_triggers_web_search(self):
+        from online_pipeline.api.gateway import _local_recall_is_weak, settings
+
+        candidates = self._docs(settings.web_search_min_local_results - 1, score=9.0)
+        assert _local_recall_is_weak(candidates, candidates) is True
+
+    def test_low_relevance_triggers_web_search_despite_enough_hits(self):
+        from online_pipeline.api.gateway import _local_recall_is_weak, settings
+
+        candidates = self._docs(settings.web_search_min_local_results + 2)
+        reranked = self._docs(3, score=settings.web_search_min_relevance_score - 1.0)
+        assert _local_recall_is_weak(candidates, reranked) is True
+
+    def test_strong_relevance_skips_web_search(self):
+        from online_pipeline.api.gateway import _local_recall_is_weak, settings
+
+        candidates = self._docs(settings.web_search_min_local_results + 2)
+        reranked = self._docs(3, score=settings.web_search_min_relevance_score + 5.0)
+        assert _local_recall_is_weak(candidates, reranked) is False
+
+    def test_missing_rerank_scores_do_not_trigger_web_search(self):
+        from online_pipeline.api.gateway import _local_recall_is_weak, settings
+
+        # Cross-encoder unavailable: no absolute score exists to threshold against.
+        candidates = self._docs(settings.web_search_min_local_results + 2)
+        assert _local_recall_is_weak(candidates, candidates) is False
+
+

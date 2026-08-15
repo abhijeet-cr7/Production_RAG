@@ -40,12 +40,12 @@ class TestTextCleaner:
         assert self.cleaner.clean("") == ""
 
 
-# ── MetadataExtractor ─────────────────────────────────────────────────────────
+# ── MetadataEnricher ───────────────────────────────────────────────────────
 
-class TestMetadataExtractor:
+class TestMetadataEnricher:
     def setup_method(self):
-        from offline_pipeline.preprocessors.metadata_extractor import MetadataExtractor
-        self.extractor = MetadataExtractor()
+        from offline_pipeline.preprocessors.metadata_enricher import MetadataEnricher
+        self.extractor = MetadataEnricher()
 
     def test_adds_required_fields(self):
         doc = {"text": "hello world", "metadata": {"source": "test.txt"}}

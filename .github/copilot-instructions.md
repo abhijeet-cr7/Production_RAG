@@ -29,7 +29,7 @@ Two coordinated pipelines share config, the vector DB client, and the embedding 
 │  HTTP POST /ingest                                      │
 │    → DocumentExtractor.extract()                        │
 │    → TextCleaner.clean()                                │
-│    → MetadataExtractor.enrich()                         │
+│    → MetadataEnricher.enrich()                         │
 │    → TextChunker.chunk()                                │
 │    → embed_text() per chunk                             │
 │    → VectorDBClient.upsert()                            │
@@ -81,6 +81,16 @@ Single `Settings` class (pydantic-settings, reads from `.env`).
 | `vector_weight` | float | `0.7` | Vector search contribution in RRF fusion |
 | `chunk_size` | int | `512` | Max tokens per chunk |
 | `chunk_overlap` | int | `64` | Token overlap between consecutive chunks |
+| `tavily_api_key` | str | `""` | Tavily web search key |
+| `web_search_enabled` | bool | `True` | Allow web-search top-up when local recall is thin |
+| `web_search_max_results` | int | `5` | Max Tavily results per query |
+| `web_search_min_local_results` | int | `3` | Local hits below this trigger web search |
+| `web_search_min_relevance_score` | float | `0.0` | Top cross-encoder score below this triggers web search |
+| `tavily_search_depth` | str | `"basic"` | `"basic"` or `"advanced"` |
+| `langsmith_tracing` | bool | `False` | Enable LangSmith tracing |
+| `langsmith_api_key` | str | `""` | LangSmith API key |
+| `langsmith_project` | str | `"production-rag"` | LangSmith project name |
+| `langsmith_endpoint` | str | `"https://api.smith.langchain.com"` | LangSmith API endpoint |
 
 Import via: `from config.settings import settings`
 
@@ -126,7 +136,7 @@ Normalises extracted text.
 |---|---|
 | `clean(text: str) → str` | Runs: Unicode NFKC normalisation → control char removal (keeps `\n`, `\t`) → collapse 3+ blank lines to 2 → collapse multiple spaces |
 
-#### `offline_pipeline/preprocessors/metadata_extractor.py` — `MetadataExtractor`
+#### `offline_pipeline/preprocessors/metadata_enricher.py` — `MetadataEnricher`
 Enriches the document dict with derived metadata.
 
 | Method | Args | Returns | Added Keys |
@@ -432,4 +442,9 @@ MISTRAL_API_KEY=       # alternative free LLM
 EMBEDDING_PROVIDER=sentence-transformers   # local, no key needed
 EMBEDDING_MODEL=all-MiniLM-L6-v2
 EMBEDDING_DIMENSION=384
+TAVILY_API_KEY=        # web search fallback (https://app.tavily.com)
+WEB_SEARCH_ENABLED=true
+LANGSMITH_TRACING=false
+LANGSMITH_API_KEY=     # https://smith.langchain.com
+LANGSMITH_PROJECT=production-rag
 ```
