@@ -1,11 +1,54 @@
 import { useState, useRef } from 'react'
 
+const ALLOWED = ['.pdf', '.docx', '.txt']
+
 export default function QueryPanel() {
   const [query, setQuery] = useState('')
   const [loading, setLoading] = useState(false)
+  const [attaching, setAttaching] = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
   const [messages, setMessages] = useState([])
   const textareaRef = useRef()
+  const fileInputRef = useRef()
+
+  async function attachFiles(fileList) {
+    const incoming = Array.from(fileList)
+    const accepted = incoming.filter(f => ALLOWED.includes('.' + f.name.split('.').pop().toLowerCase()))
+    const rejected = incoming.filter(f => !accepted.includes(f))
+
+    if (rejected.length) {
+      setErrorMsg(`Skipped unsupported file(s): ${rejected.map(f => f.name).join(', ')}`)
+    } else {
+      setErrorMsg('')
+    }
+    if (!accepted.length) return
+
+    setAttaching(true)
+    const form = new FormData()
+    accepted.forEach(f => form.append('files', f))
+
+    try {
+      const res = await fetch('/ingest', { method: 'POST', body: form })
+      const data = await res.json()
+      if (!res.ok) {
+        setErrorMsg(data.detail || 'File indexing failed.')
+        return
+      }
+      const summary = data.files
+        .map(f => f.status === 'indexed'
+          ? `${f.filename} (${f.chunks_indexed} chunks)`
+          : `${f.filename} — failed: ${f.detail}`)
+        .join(', ')
+      setMessages(prev => [
+        ...prev,
+        { role: 'system', content: `📎 Added to knowledge base: ${summary}` },
+      ])
+    } catch {
+      setErrorMsg('Could not reach the API. Is the server running?')
+    } finally {
+      setAttaching(false)
+    }
+  }
 
   async function submit(e) {
     e.preventDefault()
@@ -25,7 +68,9 @@ export default function QueryPanel() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           query: userText,
-          chat_history: nextMessages,
+          chat_history: nextMessages
+            .filter(({ role }) => role !== 'system')
+            .map(({ role, content }) => ({ role, content })),
         }),
       })
       const data = await res.json()
@@ -89,6 +134,9 @@ export default function QueryPanel() {
           </p>
         )}
         {messages.map((message, i) => (
+          message.role === 'system' ? (
+            <p key={i} className="chat-notice">{message.content}</p>
+          ) : (
           <div key={i} className={`chat-bubble ${message.role}`}>
             <p className="chat-role">{message.role === 'user' ? 'You' : 'Assistant'}</p>
             <p className="chat-text">{message.content}</p>
@@ -115,8 +163,11 @@ export default function QueryPanel() {
               </details>
             )}
           </div>
+          )
         ))}
-        {loading && <p className="chat-thinking">Assistant is thinking…</p>}
+        {(loading || attaching) && (
+          <p className="chat-thinking">{attaching ? 'Indexing attached files…' : 'Assistant is thinking…'}</p>
+        )}
       </div>
 
       <form onSubmit={submit} className="query-form">
@@ -130,13 +181,32 @@ export default function QueryPanel() {
           rows={3}
           disabled={loading}
         />
-        <button
-          type="submit"
-          className="btn btn-primary"
-          disabled={!query.trim() || loading}
-        >
-          {loading ? <><span className="spinner" /> Thinking…</> : 'Ask'}
-        </button>
+        <div className="query-actions">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".pdf,.docx,.txt"
+            multiple
+            style={{ display: 'none' }}
+            onChange={e => { if (e.target.files.length) attachFiles(e.target.files); e.target.value = '' }}
+          />
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => fileInputRef.current.click()}
+            disabled={attaching || loading}
+            title="Attach and index documents"
+          >
+            📎 Add files
+          </button>
+          <button
+            type="submit"
+            className="btn btn-primary"
+            disabled={!query.trim() || loading}
+          >
+            {loading ? <><span className="spinner" /> Thinking…</> : 'Ask'}
+          </button>
+        </div>
       </form>
 
       {errorMsg && <p className="msg error">{errorMsg}</p>}

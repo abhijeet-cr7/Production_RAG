@@ -1,8 +1,8 @@
 """Redis-backed embedding cache.
 
 Caches query embedding vectors in Redis to avoid redundant API calls.
-The cache key is derived from the query text; values are stored as
-JSON-serialised float lists.
+The cache key is derived from the embedding model identity + query text;
+values are stored as JSON-serialised float lists.
 """
 
 from __future__ import annotations
@@ -72,8 +72,14 @@ class EmbeddingCache:
         ttl: Time-to-live for cached entries in seconds.
     """
 
-    def __init__(self, redis_url: str, ttl: int = 86400) -> None:
+    def __init__(
+        self,
+        redis_url: str,
+        ttl: int = 86400,
+        model_id: str | None = None,
+    ) -> None:
         self.ttl = ttl
+        self.model_id = model_id or self._default_model_id()
         self._redis = self._connect(redis_url)
 
     # ── public API ───────────────────────────────────────────────────────────
@@ -100,10 +106,18 @@ class EmbeddingCache:
 
     # ── private helpers ──────────────────────────────────────────────────────
 
-    @staticmethod
-    def _make_key(query: str) -> str:
+    def _make_key(self, query: str) -> str:
         digest = hashlib.sha256(query.encode()).hexdigest()
-        return f"emb:{digest}"
+        return f"emb:{self.model_id}:{digest}"
+
+    @staticmethod
+    def _default_model_id() -> str:
+        from config.settings import settings
+
+        # Scope cache entries by embedding space; swapping models/providers
+        # naturally creates a separate namespace to avoid stale vector reuse.
+        raw = f"{settings.embedding_provider}:{settings.embedding_model}"
+        return "".join(ch if ch.isalnum() or ch in "-._:" else "_" for ch in raw)
 
     @staticmethod
     def _connect(redis_url: str) -> Any:

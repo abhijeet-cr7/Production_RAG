@@ -25,7 +25,8 @@ class QueryRewriter:
     no API key is configured.
     """
 
-    def __init__(self, model: str = "llama-3.1-8b-instant") -> None:
+    def __init__(self, provider: str = "groq", model: str = "llama-3.1-8b-instant") -> None:
+        self.provider = provider
         self.model = model
 
     def rewrite(self, query: str) -> str:
@@ -44,17 +45,12 @@ class QueryRewriter:
             return query
 
     def _call_llm(self, query: str) -> str:
-        from groq import Groq
-        from config.settings import settings
+        from online_pipeline.llm.llm_client import LLMClient
 
-        client = Groq(api_key=settings.groq_api_key)
-        response = client.chat.completions.create(
+        client = LLMClient(
+            provider=self.provider,
             model=self.model,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": query},
-            ],
             temperature=0.0,
             max_tokens=256,
         )
-        return response.choices[0].message.content.strip()
+        return client.complete(_SYSTEM_PROMPT, query)

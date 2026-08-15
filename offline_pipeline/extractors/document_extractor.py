@@ -61,7 +61,7 @@ class DocumentExtractor:
         pages: list[str] = []
         for page in reader.pages:
             page_text = page.extract_text() or ""
-            if not page_text.strip():
+            if not page_text.strip(): # this is the same as trim in javascript
                 page_text = self._ocr_page(page)
             pages.append(page_text)
 

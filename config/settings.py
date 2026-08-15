@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""         # https://aistudio.google.com
     cohere_api_key: str = ""         # https://dashboard.cohere.com
     mistral_api_key: str = ""        # https://console.mistral.ai
+    llm_routing_mode: str = "balanced"  # "cost_optimized" | "balanced" | "quality"
+    query_rewrite_provider: str = "groq"
+    query_rewrite_model: str = "llama-3.1-8b-instant"
+    answer_generation_provider: str = "groq"
+    answer_generation_model: str = ""
+    llm_fallback_providers: str = "gemini,openai,anthropic"
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     # provider: "sentence-transformers" (local/free) | "openai" | "cohere" | "gemini"
@@ -50,8 +56,25 @@ class Settings(BaseSettings):
     vector_weight: float = 0.7
 
     # ── Chunking ─────────────────────────────────────────────────────────────
+    chunking_strategy: str = "auto"  # "auto" | "fixed_token" | "recursive"
     chunk_size: int = 512
     chunk_overlap: int = 64
+
+    # ── Web search (Tavily) ──────────────────────────────────────────────────
+    tavily_api_key: str = ""          # https://app.tavily.com
+    web_search_enabled: bool = True   # allow falling back to the web
+    web_search_max_results: int = 5
+    # Local hits below this count trigger a web-search top-up.
+    web_search_min_local_results: int = 3
+    # Cross-encoder logit below which the best local hit counts as irrelevant.
+    web_search_min_relevance_score: float = 0.0
+    tavily_search_depth: str = "basic"  # "basic" | "advanced"
+
+    # ── Observability (LangSmith) ────────────────────────────────────────────
+    langsmith_tracing: bool = False
+    langsmith_api_key: str = ""       # https://smith.langchain.com
+    langsmith_project: str = "production-rag"
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
 
 
 settings = Settings()

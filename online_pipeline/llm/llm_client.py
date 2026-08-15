@@ -1,4 +1,4 @@
-"""LLM client: wraps OpenAI (default) and Anthropic chat completion APIs."""
+"""LLM client: wraps configured chat completion providers."""
 
 from __future__ import annotations
 
@@ -18,10 +18,10 @@ _SYSTEM_PROMPT = (
 
 
 class LLMClient:
-    """Generate answers from a query + retrieved context.
+    """Generate chat completions and grounded RAG answers.
 
     Args:
-        provider: ``"openai"`` (default) or ``"anthropic"``.
+        provider: LLM provider name.
         model: Model identifier to use (defaults to provider's recommended model).
         temperature: Sampling temperature.
         max_tokens: Maximum tokens in the completion.
@@ -50,6 +50,18 @@ class LLMClient:
         self.max_tokens = max_tokens
 
     # ── public API ───────────────────────────────────────────────────────────
+
+    def complete(self, system_prompt: str, user_message: str) -> str:
+        """Return a chat completion for a system prompt and user message."""
+        dispatch = {
+            "groq": self._groq,
+            "gemini": self._gemini,
+            "cohere": self._cohere,
+            "mistral": self._mistral,
+            "anthropic": self._anthropic,
+        }
+        handler = dispatch.get(self.provider, self._openai)
+        return handler(system_prompt, user_message)
 
     def generate(
         self,
@@ -81,26 +93,18 @@ class LLMClient:
             f"Context:\n{context}\n\n"
             f"Latest user question: {query}"
         )
-        dispatch = {
-            "groq": self._groq,
-            "gemini": self._gemini,
-            "cohere": self._cohere,
-            "mistral": self._mistral,
-            "anthropic": self._anthropic,
-        }
-        handler = dispatch.get(self.provider, self._openai)
-        return handler(user_message)
+        return self.complete(_SYSTEM_PROMPT, user_message)
 
     # ── private helpers ──────────────────────────────────────────────────────
 
-    def _openai(self, user_message: str) -> str:
+    def _openai(self, system_prompt: str, user_message: str) -> str:
         from openai import OpenAI
 
         client = OpenAI(api_key=settings.openai_api_key)
         response = client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
             temperature=self.temperature,
@@ -108,26 +112,26 @@ class LLMClient:
         )
         return response.choices[0].message.content.strip()
 
-    def _anthropic(self, user_message: str) -> str:
+    def _anthropic(self, system_prompt: str, user_message: str) -> str:
         import anthropic
 
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         message = client.messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            system=_SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
         return message.content[0].text.strip()
 
-    def _groq(self, user_message: str) -> str:
+    def _groq(self, system_prompt: str, user_message: str) -> str:
         from groq import Groq
 
         client = Groq(api_key=settings.groq_api_key)
         response = client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
             temperature=self.temperature,
@@ -135,13 +139,13 @@ class LLMClient:
         )
         return response.choices[0].message.content.strip()
 
-    def _gemini(self, user_message: str) -> str:
+    def _gemini(self, system_prompt: str, user_message: str) -> str:
         import google.generativeai as genai
 
         genai.configure(api_key=settings.gemini_api_key)
         gemini_model = genai.GenerativeModel(
             model_name=self.model,
-            system_instruction=_SYSTEM_PROMPT,
+            system_instruction=system_prompt,
         )
         response = gemini_model.generate_content(
             user_message,
@@ -152,27 +156,27 @@ class LLMClient:
         )
         return response.text.strip()
 
-    def _cohere(self, user_message: str) -> str:
+    def _cohere(self, system_prompt: str, user_message: str) -> str:
         import cohere
 
         client = cohere.ClientV2(api_key=settings.cohere_api_key)
         response = client.chat(
             model=self.model,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
         )
         return response.message.content[0].text.strip()
 
-    def _mistral(self, user_message: str) -> str:
+    def _mistral(self, system_prompt: str, user_message: str) -> str:
         from mistralai import Mistral
 
         client = Mistral(api_key=settings.mistral_api_key)
         response = client.chat.complete(
             model=self.model,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
             temperature=self.temperature,
