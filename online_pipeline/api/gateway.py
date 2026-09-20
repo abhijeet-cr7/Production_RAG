@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from config.settings import settings
@@ -18,7 +20,7 @@ from offline_pipeline.extractors.document_extractor import DocumentExtractor
 from offline_pipeline.extractors.web_extractor import WebExtractor
 from offline_pipeline.preprocessors.cleaner import TextCleaner
 from offline_pipeline.preprocessors.metadata_enricher import MetadataEnricher
-from online_pipeline.cache.embedding_cache import EmbeddingCache, embed_text
+from online_pipeline.cache.embedding_cache import EmbeddingCache, embed_text, embed_texts
 from online_pipeline.context_builder.builder import ContextBuilder
 from online_pipeline.llm.router import LLMRouter
 from online_pipeline.observability.tracing import configure_tracing, traced
@@ -26,6 +28,8 @@ from online_pipeline.reranker.reranker import Reranker
 from online_pipeline.retrieval.hybrid_retriever import HybridRetriever
 from online_pipeline.retrieval.web_search import TavilyWebSearch
 from vector_db.client import VectorDBClient
+
+logger = logging.getLogger(__name__)
 
 
 # ── Request / Response models ────────────────────────────────────────────────
@@ -96,7 +100,12 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     _vector_db.ensure_collection()
     _llm_router = LLMRouter()
     _cache = EmbeddingCache(redis_url=settings.redis_url)
-    _retriever = HybridRetriever(vector_db=_vector_db)
+    _retriever = HybridRetriever(
+        vector_db=_vector_db,
+        bm25_weight=settings.bm25_weight,
+        vector_weight=settings.vector_weight,
+    )
+    _refresh_lexical_index()
     _reranker = Reranker()
     _context_builder = ContextBuilder()
     _web_search = TavilyWebSearch()
@@ -109,9 +118,28 @@ app = FastAPI(title="Production RAG API", version="0.1.0", lifespan=lifespan)
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 
+def _refresh_lexical_index() -> None:
+    """Rebuild the BM25 index from the chunks currently in the vector store.
+
+    The retriever is constructed without a corpus, so without this call the
+    lexical branch never runs and "hybrid" retrieval is dense-only.
+    """
+    if not settings.bm25_enabled or _retriever is None or _vector_db is None:
+        return
+    try:
+        corpus = _vector_db.scroll_all(limit=settings.bm25_max_corpus_chunks)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read corpus for BM25 (%s); retrieval is dense-only.", exc)
+        return
+    _retriever.load_corpus(corpus)
+
+
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "lexical_retrieval": bool(_retriever and _retriever.lexical_enabled),
+    }
 
 
 @traced(name="index_document", run_type="chain")
@@ -130,20 +158,25 @@ def _index_document(doc: dict) -> tuple[str, int]:
     if not chunks:
         raise HTTPException(status_code=422, detail="Document produced no text chunks.")
 
-    for chunk in chunks:
-        vector = embed_text(chunk["text"])
+    # One batched embed call for the whole document, and one upsert: embedding
+    # per chunk dominated ingest time, and a round trip per chunk followed it.
+    vectors = embed_texts([chunk["text"] for chunk in chunks])
+
+    points = []
+    for chunk, vector in zip(chunks, vectors):
         # Qdrant requires IDs to be unsigned ints or UUIDs.
         # Derive a stable UUID5 from the doc_id + chunk_index.
         point_id = str(uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"{doc['metadata']['doc_id']}_{chunk['metadata']['chunk_index']}",
         ))
-        _vector_db.upsert([{
+        points.append({
             "id": point_id,
             "vector": vector,
             "payload": chunk["metadata"],
             "text": chunk["text"],
-        }])
+        })
+    _vector_db.upsert(points)
 
     return doc["metadata"]["doc_id"], len(chunks)
 
@@ -195,6 +228,9 @@ async def ingest(files: list[UploadFile] = File(...)) -> IngestResponse:
     if all(r.status == "error" for r in results):
         raise HTTPException(status_code=400, detail="; ".join(f"{r.filename}: {r.detail}" for r in results))
 
+    # New chunks are invisible to the lexical branch until the index is rebuilt.
+    _refresh_lexical_index()
+
     return IngestResponse(
         files=results,
         total_chunks_indexed=sum(r.chunks_indexed for r in results),
@@ -213,6 +249,7 @@ async def ingest_url(request: IngestUrlRequest) -> IngestSourceResponse:
         raise HTTPException(status_code=422, detail=f"Failed to fetch URL: {exc}") from exc
 
     doc_id, chunk_count = _index_document(doc)
+    _refresh_lexical_index()
     return IngestSourceResponse(source=request.url, chunks_indexed=chunk_count, doc_id=doc_id)
 
 
@@ -232,6 +269,7 @@ async def ingest_api(request: IngestApiRequest) -> IngestSourceResponse:
         raise HTTPException(status_code=422, detail=f"Failed to fetch API: {exc}") from exc
 
     doc_id, chunk_count = _index_document(doc)
+    _refresh_lexical_index()
     return IngestSourceResponse(source=request.url, chunks_indexed=chunk_count, doc_id=doc_id)
 
 
@@ -294,10 +332,15 @@ async def query(request: QueryRequest) -> QueryResponse:
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query must not be empty.")
 
-    rewritten = _stage_rewrite(request.query)
-    embedding = _stage_embed(rewritten)
-    candidates = _stage_retrieve(rewritten, embedding, request.metadata_filter)
-    reranked = _stage_rerank(rewritten, candidates, request.top_k)
+    # Every stage below is synchronous and either network- or CPU-bound. Called
+    # directly they block the event loop, so one worker serves one request at a
+    # time; run_in_threadpool lets concurrent queries overlap.
+    rewritten = await run_in_threadpool(_stage_rewrite, request.query)
+    embedding = await run_in_threadpool(_stage_embed, rewritten)
+    candidates = await run_in_threadpool(
+        _stage_retrieve, rewritten, embedding, request.metadata_filter
+    )
+    reranked = await run_in_threadpool(_stage_rerank, rewritten, candidates, request.top_k)
 
     # Top up with live web results when the local corpus answers poorly, then
     # rerank everything together so both sources compete on one relevance scale.
@@ -305,13 +348,17 @@ async def query(request: QueryRequest) -> QueryResponse:
     web_search_used = False
     if allow_web and _web_search is not None and _web_search.available:
         if _local_recall_is_weak(candidates, reranked):
-            web_results = _stage_web_search(rewritten)
+            web_results = await run_in_threadpool(_stage_web_search, rewritten)
             if web_results:
-                reranked = _stage_rerank(rewritten, candidates + web_results, request.top_k)
+                reranked = await run_in_threadpool(
+                    _stage_rerank, rewritten, candidates + web_results, request.top_k
+                )
                 web_search_used = True
 
     context = _stage_build_context(reranked)
-    answer = _stage_generate(request.query, context, request.chat_history)
+    answer = await run_in_threadpool(
+        _stage_generate, request.query, context, request.chat_history
+    )
 
     sources = [r.get("metadata", {}) for r in reranked]
     return QueryResponse(answer=answer, sources=sources, web_search_used=web_search_used)
