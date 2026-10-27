@@ -352,3 +352,135 @@ class TestLocalRecallIsWeak:
         assert _local_recall_is_weak(candidates, candidates) is False
 
 
+
+
+# ── Generation grading ───────────────────────────────────────────────────────
+
+class TestGenerationGrader:
+    def test_parses_plain_json(self):
+        from online_pipeline.grading.grader import GenerationGrader
+
+        result = GenerationGrader.parse(
+            '{"grounded": true, "answers_question": false, "unsupported_claims": []}'
+        )
+        assert result.grounded is True
+        assert result.answers_question is False
+        assert result.acceptable is False
+
+    def test_parses_json_wrapped_in_code_fence(self):
+        from online_pipeline.grading.grader import GenerationGrader
+
+        raw = '```json\n{"grounded": false, "answers_question": true, "unsupported_claims": ["x"]}\n```'
+        result = GenerationGrader.parse(raw)
+        assert result.grounded is False
+        assert result.unsupported_claims == ["x"]
+
+    def test_string_verdicts_are_not_truthy(self):
+        from online_pipeline.grading.grader import GenerationGrader
+
+        result = GenerationGrader.parse('{"grounded": "false", "answers_question": "no"}')
+        assert result.grounded is False
+        assert result.answers_question is False
+
+    def test_rejects_unparseable_or_incomplete_reply(self):
+        from online_pipeline.grading.grader import GenerationGrader
+
+        with pytest.raises(ValueError):
+            GenerationGrader.parse("looks fine to me")
+        with pytest.raises(ValueError):
+            GenerationGrader.parse('{"grounded": true}')
+
+    def test_feedback_differs_for_ungrounded_and_unhelpful(self):
+        from online_pipeline.grading.grader import GradeResult
+
+        assert "does not support" in GradeResult(False, True, ["moon is cheese"]).feedback()
+        assert "moon is cheese" in GradeResult(False, True, ["moon is cheese"]).feedback()
+        assert "did not answer" in GradeResult(True, False).feedback()
+
+    def test_router_grading_fails_open_when_all_providers_fail(self):
+        from online_pipeline.llm.router import LLMRouter
+
+        with patch("online_pipeline.llm.router.GenerationGrader") as grader_cls:
+            grader_cls.return_value.grade.side_effect = RuntimeError("down")
+            router = LLMRouter(fallback_providers="gemini")
+            assert router.grade_answer("q", "ctx", "a") is None
+        assert grader_cls.call_count == 2  # primary + one fallback
+
+
+class TestGradedQueryFlow:
+    """Drive gateway.query() with every pipeline stage stubbed out."""
+
+    def _run(self, grades, *, web_hits=None, policy="warn", max_attempts=2, allow_web=True):
+        import asyncio
+        from online_pipeline.api import gateway
+        from online_pipeline.grading.grader import GradeResult
+
+        grade_iter = iter([GradeResult(*g) if g is not None else None for g in grades])
+        generate = MagicMock(side_effect=lambda *a, **k: f"draft{generate.call_count}")
+        web = MagicMock(return_value=web_hits or [])
+        web_client = MagicMock(available=allow_web)
+
+        patches = [
+            patch.object(gateway, "_stage_rewrite", side_effect=lambda q: q),
+            patch.object(gateway, "_stage_embed", return_value=[0.0]),
+            patch.object(gateway, "_stage_retrieve", return_value=[{"text": "t", "metadata": {}}] * 5),
+            patch.object(gateway, "_stage_rerank", side_effect=lambda q, c, k: c[:k]),
+            patch.object(gateway, "_local_recall_is_weak", return_value=False),
+            patch.object(gateway, "_stage_build_context", return_value="ctx"),
+            patch.object(gateway, "_stage_generate", generate),
+            patch.object(gateway, "_stage_grade", side_effect=lambda *a: next(grade_iter)),
+            patch.object(gateway, "_stage_web_search", web),
+            patch.object(gateway, "_web_search", web_client),
+            patch.object(gateway.settings, "web_search_enabled", True),
+            patch.object(gateway.settings, "answer_grading_enabled", True),
+            patch.object(gateway.settings, "ungrounded_answer_policy", policy),
+            patch.object(gateway.settings, "max_generation_attempts", max_attempts),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            response = asyncio.run(gateway.query(gateway.QueryRequest(query="q")))
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return response, generate, web
+
+    def test_accepted_first_draft_makes_no_extra_calls(self):
+        response, generate, web = self._run([(True, True, [])])
+        assert response.answer == "draft1"
+        assert (response.grounded, response.answer_useful, response.generation_attempts) == (True, True, 1)
+        assert generate.call_count == 1 and web.call_count == 0
+
+    def test_ungrounded_draft_is_regenerated_with_feedback(self):
+        response, generate, _ = self._run([(False, True, ["bad"]), (True, True, [])])
+        assert response.answer == "draft2"
+        assert response.generation_attempts == 2
+        assert "bad" in generate.call_args_list[1].args[3]
+
+    def test_unhelpful_answer_triggers_web_search_then_regenerates(self):
+        hits = [{"text": "web", "metadata": {}}]
+        response, generate, web = self._run([(True, False, []), (True, True, [])], web_hits=hits)
+        assert web.call_count == 1
+        assert response.web_search_used is True
+        assert response.answer == "draft2"
+
+    def test_persistent_hallucination_is_flagged_with_warning(self):
+        response, generate, _ = self._run(
+            [(False, True, []), (False, True, [])], allow_web=False
+        )
+        assert generate.call_count == 2  # bounded by max_generation_attempts
+        assert response.grounded is False
+        assert response.answer.startswith("Note: parts of this answer")
+
+    def test_persistent_hallucination_can_abstain(self):
+        response, _, _ = self._run(
+            [(False, True, []), (False, True, [])], policy="abstain", allow_web=False
+        )
+        assert "not going to guess" in response.answer
+        assert "draft" not in response.answer
+
+    def test_grader_outage_returns_answer_ungraded(self):
+        response, generate, _ = self._run([None])
+        assert response.answer == "draft1"
+        assert response.grounded is None and response.answer_useful is None
+        assert generate.call_count == 1

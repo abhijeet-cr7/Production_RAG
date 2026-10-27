@@ -20,6 +20,7 @@ from offline_pipeline.preprocessors.cleaner import TextCleaner
 from offline_pipeline.preprocessors.metadata_enricher import MetadataEnricher
 from online_pipeline.cache.embedding_cache import EmbeddingCache, embed_text
 from online_pipeline.context_builder.builder import ContextBuilder
+from online_pipeline.grading.grader import GradeResult
 from online_pipeline.llm.router import LLMRouter
 from online_pipeline.observability.tracing import configure_tracing, traced
 from online_pipeline.reranker.reranker import Reranker
@@ -46,6 +47,10 @@ class QueryResponse(BaseModel):
     answer: str
     sources: list[dict]
     web_search_used: bool = False
+    # None when grading is disabled or every grader provider failed.
+    grounded: bool | None = None
+    answer_useful: bool | None = None
+    generation_attempts: int = 1
 
 
 class IngestFileResult(BaseModel):
@@ -279,12 +284,23 @@ def _stage_build_context(chunks: list[dict]) -> str:
 
 
 @traced(name="generate_answer", run_type="llm")
-def _stage_generate(query: str, context: str, chat_history: list[dict]) -> str:
+def _stage_generate(
+    query: str,
+    context: str,
+    chat_history: list[dict],
+    feedback: str | None = None,
+) -> str:
     return _llm_router.generate_answer(
         query=query,
         context=context,
         chat_history=chat_history,
+        feedback=feedback,
     )
+
+
+@traced(name="grade_generation", run_type="llm")
+def _stage_grade(query: str, context: str, answer: str) -> GradeResult | None:
+    return _llm_router.grade_answer(query, context, answer)
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -302,19 +318,75 @@ async def query(request: QueryRequest) -> QueryResponse:
     # Top up with live web results when the local corpus answers poorly, then
     # rerank everything together so both sources compete on one relevance scale.
     allow_web = settings.web_search_enabled if request.web_search is None else request.web_search
+    allow_web = allow_web and _web_search is not None and _web_search.available
     web_search_used = False
-    if allow_web and _web_search is not None and _web_search.available:
-        if _local_recall_is_weak(candidates, reranked):
-            web_results = _stage_web_search(rewritten)
-            if web_results:
-                reranked = _stage_rerank(rewritten, candidates + web_results, request.top_k)
-                web_search_used = True
+    if allow_web and _local_recall_is_weak(candidates, reranked):
+        topped_up = _web_top_up(rewritten, candidates, request.top_k)
+        if topped_up is not None:
+            reranked, web_search_used = topped_up, True
 
     context = _stage_build_context(reranked)
     answer = _stage_generate(request.query, context, request.chat_history)
+    attempts = 1
+
+    grade: GradeResult | None = None
+    if settings.answer_grading_enabled:
+        grade = _stage_grade(request.query, context, answer)
+
+        # Ungrounded draft: regenerate with the grader's feedback, bounded by
+        # max_generation_attempts so a stubborn model cannot loop forever.
+        while (
+            grade is not None
+            and not grade.grounded
+            and attempts < settings.max_generation_attempts
+        ):
+            answer = _stage_generate(request.query, context, request.chat_history, grade.feedback())
+            attempts += 1
+            grade = _stage_grade(request.query, context, answer)
+
+        # Still unusable and the web has not been tried: the context itself is
+        # the problem, so fetch fresh evidence and make one last attempt.
+        if grade is not None and not grade.acceptable and allow_web and not web_search_used:
+            topped_up = _web_top_up(rewritten, candidates, request.top_k)
+            if topped_up is not None:
+                reranked, web_search_used = topped_up, True
+                context = _stage_build_context(reranked)
+                answer = _stage_generate(request.query, context, request.chat_history, grade.feedback())
+                attempts += 1
+                grade = _stage_grade(request.query, context, answer)
+
+        if grade is not None and not grade.grounded:
+            answer = _apply_ungrounded_policy(answer)
 
     sources = [r.get("metadata", {}) for r in reranked]
-    return QueryResponse(answer=answer, sources=sources, web_search_used=web_search_used)
+    return QueryResponse(
+        answer=answer,
+        sources=sources,
+        web_search_used=web_search_used,
+        grounded=None if grade is None else grade.grounded,
+        answer_useful=None if grade is None else grade.answers_question,
+        generation_attempts=attempts,
+    )
+
+
+def _web_top_up(query: str, candidates: list[dict], top_k: int) -> list[dict] | None:
+    """Rerank local candidates together with web hits; None when the web gave nothing."""
+    web_results = _stage_web_search(query)
+    if not web_results:
+        return None
+    return _stage_rerank(query, candidates + web_results, top_k)
+
+
+def _apply_ungrounded_policy(answer: str) -> str:
+    if settings.ungrounded_answer_policy == "abstain":
+        return (
+            "I could not produce an answer that is fully supported by the "
+            "available sources, so I am not going to guess."
+        )
+    return (
+        "Note: parts of this answer could not be verified against the sources.\n\n"
+        + answer
+    )
 
 
 def _local_recall_is_weak(candidates: list[dict], reranked: list[dict]) -> bool:

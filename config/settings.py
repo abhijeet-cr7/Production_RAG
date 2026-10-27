@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     mistral_api_key: str = ""        # https://console.mistral.ai
     llm_routing_mode: str = "balanced"  # "cost_optimized" | "balanced" | "quality"
     query_rewrite_provider: str = "groq"
-    query_rewrite_model: str = "llama-3.1-8b-instant"
+    query_rewrite_model: str = "openai/gpt-oss-20b"  # llama-3.1-8b-instant was decommissioned
     answer_generation_provider: str = "groq"
     answer_generation_model: str = ""
     llm_fallback_providers: str = "gemini,openai,anthropic"
@@ -69,6 +69,16 @@ class Settings(BaseSettings):
     # Cross-encoder logit below which the best local hit counts as irrelevant.
     web_search_min_relevance_score: float = 0.0
     tavily_search_depth: str = "basic"  # "basic" | "advanced"
+
+    # ── Generation grading (hallucination + usefulness check) ───────────────
+    answer_grading_enabled: bool = True
+    grader_provider: str = "groq"
+    grader_model: str = "openai/gpt-oss-20b"
+    # Total generation attempts per request: first draft + stricter regenerations.
+    max_generation_attempts: int = 2
+    # What to do when the final answer is still not grounded in the context:
+    # "warn" prepends a caveat, "abstain" replaces the answer with a refusal.
+    ungrounded_answer_policy: str = "warn"  # "warn" | "abstain"
 
     # ── Observability (LangSmith) ────────────────────────────────────────────
     langsmith_tracing: bool = False

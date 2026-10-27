@@ -25,7 +25,7 @@ class QueryRewriter:
     no API key is configured.
     """
 
-    def __init__(self, provider: str = "groq", model: str = "llama-3.1-8b-instant") -> None:
+    def __init__(self, provider: str = "groq", model: str = "openai/gpt-oss-20b") -> None:
         self.provider = provider
         self.model = model
 

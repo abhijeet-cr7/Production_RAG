@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from config.settings import settings
+from online_pipeline.grading.grader import GenerationGrader, GradeResult
 from online_pipeline.llm.llm_client import LLMClient
 from online_pipeline.query_rewrite.rewriter import QueryRewriter
 
@@ -53,6 +54,7 @@ class LLMRouter:
         query: str,
         context: str,
         chat_history: list[dict[str, str]] | None = None,
+        feedback: str | None = None,
     ) -> str:
         """Generate a grounded answer with the selected answer model."""
         route = self._route_for("rag_answer")
@@ -65,12 +67,32 @@ class LLMRouter:
                     temperature=route.temperature,
                     max_tokens=route.max_tokens,
                 )
-                return client.generate(query=query, context=context, chat_history=chat_history)
+                return client.generate(
+                    query=query,
+                    context=context,
+                    chat_history=chat_history,
+                    feedback=feedback,
+                )
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 logger.warning("Answer provider %s failed: %s", provider, exc)
 
         raise RuntimeError("All configured LLM providers failed.") from last_error
+
+    def grade_answer(self, query: str, context: str, answer: str) -> GradeResult | None:
+        """Grade *answer* against *context*; None when every grader provider fails.
+
+        Grading is a safety net, so an outage must not block the answer itself.
+        """
+        for provider in self._providers_with_fallbacks(settings.grader_provider):
+            model = settings.grader_model if provider == settings.grader_provider else None
+            try:
+                return GenerationGrader(provider=provider, model=model).grade(
+                    query, context, answer
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Grader provider %s failed: %s", provider, exc)
+        return None
 
     def generate(self, task: str, **kwargs: Any) -> str:
         """Generic task entry point for orchestration-friendly callers."""
@@ -81,6 +103,7 @@ class LLMRouter:
                 query=kwargs["query"],
                 context=kwargs["context"],
                 chat_history=kwargs.get("chat_history"),
+                feedback=kwargs.get("feedback"),
             )
         raise ValueError(f"Unsupported LLM task: {task}")
 

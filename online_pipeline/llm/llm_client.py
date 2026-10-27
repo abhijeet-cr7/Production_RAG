@@ -29,7 +29,7 @@ class LLMClient:
 
     # Provider → recommended free model
     _DEFAULT_MODELS: dict[str, str] = {
-        "groq": "llama-3.1-8b-instant",   # free tier at console.groq.com
+        "groq": "openai/gpt-oss-20b",     # free tier at console.groq.com (llama-3.1-8b-instant was decommissioned)
         "gemini": "gemini-1.5-flash",       # free tier at aistudio.google.com
         "cohere": "command-r",              # free tier at dashboard.cohere.com
         "mistral": "mistral-small-latest",  # free tier at console.mistral.ai
@@ -45,7 +45,7 @@ class LLMClient:
         max_tokens: int = 1024,
     ) -> None:
         self.provider = provider
-        self.model = model or self._DEFAULT_MODELS.get(provider, "llama-3.1-8b-instant")
+        self.model = model or self._DEFAULT_MODELS.get(provider, "openai/gpt-oss-20b")
         self.temperature = temperature
         self.max_tokens = max_tokens
 
@@ -68,12 +68,14 @@ class LLMClient:
         query: str,
         context: str,
         chat_history: list[dict[str, str]] | None = None,
+        feedback: str | None = None,
     ) -> str:
         """Return a grounded answer for *query* given *context*.
 
         Args:
             query: The original user question.
             context: Assembled context string from the context builder.
+            feedback: Grader note about a rejected earlier draft, for a retry.
 
         Returns:
             Generated answer string.
@@ -93,6 +95,8 @@ class LLMClient:
             f"Context:\n{context}\n\n"
             f"Latest user question: {query}"
         )
+        if feedback:
+            user_message += f"\n\nReviewer feedback: {feedback}"
         return self.complete(_SYSTEM_PROMPT, user_message)
 
     # ── private helpers ──────────────────────────────────────────────────────

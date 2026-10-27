@@ -4,6 +4,42 @@ A complete, chronological walkthrough of every code file, what it does, how data
 
 ---
 
+## What Changed Recently
+
+Read this first if you are coming back to the project. Newest first.
+
+### Generation grading — hallucination and usefulness check *(branch `feat/generation-grading`)*
+
+Ported from the LangGraph Agentic-RAG repo (hallucination grader + answer grader), adapted to this pipeline:
+
+| Idea in the LangGraph repo | Applied here? | How / why not |
+|---|---|---|
+| Hallucination grader (is the answer grounded in the docs?) | **Yes** | `online_pipeline/grading/grader.py`, called after every draft. |
+| Answer grader (does the answer address the question?) | **Yes** | Same single LLM call as above (one JSON verdict with two booleans), halving grading latency and cost. |
+| Retry generation when not grounded | **Yes, bounded** | One stricter regeneration (`max_generation_attempts`, default 2). The LangGraph version loops with no cap. |
+| "Not useful" → web search | **Yes** | If the answer is unhelpful or still ungrounded and web search has not run yet, fetch Tavily results, rerank with local chunks, regenerate once. |
+| Per-document LLM relevance grading | **No (deliberately)** | The cross-encoder reranker already scores every candidate; one LLM call per chunk adds cost and latency for little gain. The reranker score drives the pre-generation web-search gate instead. |
+| Question router (vectorstore vs web) | **No** | The corpus is user-uploaded and open-ended, so there is no fixed topic list to route on. Web search is a fallback, not a first choice. |
+| Web search fallback | **Already existed** | `TavilyWebSearch` (see Step 6b); grading adds a second, post-generation trigger. |
+
+Additional hardening that the LangGraph repo does not have:
+
+- **Fail-open**: if every grader provider errors, the answer is returned ungraded (`grounded: null`) instead of failing the request.
+- **Unparseable grader output** (code fences, prose, `"false"` as a string) is handled by tolerant parsing; incomplete verdicts raise and fall through to the next provider.
+- **Ungrounded policy** (`ungrounded_answer_policy`): after the retries are spent, `warn` prepends a caveat, `abstain` replaces the answer with a refusal.
+- **Observability**: `grade_generation` is a traced stage in LangSmith.
+- The `/query` response gains `grounded`, `answer_useful` and `generation_attempts`.
+
+New settings: `answer_grading_enabled`, `grader_provider`, `grader_model`, `max_generation_attempts`, `ungrounded_answer_policy`.
+
+### Earlier changes now reflected in this document
+
+- **Web search fallback** (Tavily) with a weak-local-recall gate, and **LangSmith tracing** of every stage.
+- **`POST /ingest/url`** and **`POST /ingest/api`** now use `WebExtractor` / `APIExtractor` (previously CLI-only).
+- Groq default model changed from the decommissioned `llama-3.1-8b-instant` to `openai/gpt-oss-20b`.
+
+---
+
 ## Table of Contents
 
 1. [The Big Picture](#the-big-picture)
@@ -23,8 +59,11 @@ A complete, chronological walkthrough of every code file, what it does, how data
    - [Step 4 — Embedding Cache + Embed](#step-4--embedding-cache--embed)
    - [Step 5 — Hybrid Retrieval](#step-5--hybrid-retrieval)
    - [Step 6 — Reranking](#step-6--reranking)
+   - [Step 6b — Web Search Fallback](#step-6b--web-search-fallback)
    - [Step 7 — Context Building](#step-7--context-building)
    - [Step 8 — LLM Answer Generation](#step-8--llm-answer-generation)
+   - [Step 9 — Generation Grading](#step-9--generation-grading)
+   - [Observability](#observability-langsmith)
 5. [Infrastructure Services](#infrastructure-services)
 6. [Why This Architecture?](#why-this-architecture)
 
@@ -50,7 +89,8 @@ This system has **two completely separate pipelines** that share infrastructure:
 │  ONLINE PIPELINE  (reads from the knowledge base to answer)   │
 │                                                               │
 │  HTTP /query → Rewrite → [Redis cache] → Embed →             │
-│  HybridRetrieve → Rerank → BuildContext → LLM → Answer       │
+│  HybridRetrieve → Rerank → [Web top-up if weak] →             │
+│  BuildContext → LLM → Grade → [retry / web] → Answer          │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -90,6 +130,9 @@ settings = Settings()  # singleton at module level
 | Qdrant settings | Where vectors are stored |
 | `top_k_retrieval` / `top_k_rerank` | Pipeline funnel sizes |
 | `chunking_strategy` / `chunk_size` | How documents are split |
+| `tavily_api_key`, `web_search_*` | Web fallback and its weak-recall thresholds |
+| `answer_grading_enabled`, `grader_*`, `max_generation_attempts`, `ungrounded_answer_policy` | Hallucination / usefulness grading loop |
+| `langsmith_*` | Tracing |
 
 ---
 
@@ -151,9 +194,11 @@ file_path (.pdf / .docx / .txt)
 **Why Tesseract OCR fallback?**  
 Many PDFs (scanned documents, report exports) have image-based pages where `pypdf` extracts nothing. The fallback renders the page as an image and runs OCR to recover the text. Without this, scanned documents would silently produce empty chunks.
 
-**Other extractors (not used in the `/ingest` route, available for CLI/batch use):**
-- `web_extractor.py` — `WebExtractor`: uses `requests` + `BeautifulSoup` to scrape a URL. Strips nav/footer/script/style tags to get clean body text.
-- `api_extractor.py` — `APIExtractor`: uses `httpx` to hit a JSON REST endpoint. Can optionally pick only specific fields from the JSON response.
+**Other extractors, exposed through their own routes:**
+- `web_extractor.py` — `WebExtractor` (`POST /ingest/url`): uses `requests` + `BeautifulSoup` to scrape a URL. Strips nav/footer/script/style tags to get clean body text.
+- `api_extractor.py` — `APIExtractor` (`POST /ingest/api`): uses `httpx` to hit a JSON REST endpoint. Can optionally pick only specific fields from the JSON response.
+
+All three routes converge on the same `_index_document()` helper (clean → enrich → chunk → embed → upsert).
 
 ---
 
@@ -352,11 +397,17 @@ POST /query {"query": "...", "top_k": 5}
         │       └── miss → embed_text(rewritten)     ← compute + cache
         ├── 3. HybridRetriever.retrieve(...)         ← BM25 + Vector → RRF fusion
         ├── 4. Reranker.rerank(...)                  ← cross-encoder scoring
+        ├── 4b. weak local recall? → TavilyWebSearch → rerank local + web together
         ├── 5. ContextBuilder.build(reranked)        ← format chunks for LLM
-        └── 6. LLMRouter.generate_answer(...)        ← final LLM call
+        ├── 6. LLMRouter.generate_answer(...)        ← draft answer
+        └── 7. LLMRouter.grade_answer(...)           ← grounded? useful?
+                ├── not grounded → regenerate with feedback (bounded)
+                ├── not useful / still ungrounded, no web yet → web top-up → regenerate
+                └── still not grounded → warn or abstain (policy)
         │
         ▼
-{"answer": "...", "sources": [...metadata...]}
+{"answer": "...", "sources": [...], "web_search_used": bool,
+ "grounded": bool|null, "answer_useful": bool|null, "generation_attempts": int}
 ```
 
 ---
@@ -371,6 +422,7 @@ The gateway is the only public-facing entry point. At startup, the `lifespan` co
 ```python
 @asynccontextmanager
 async def lifespan(app):
+    configure_tracing()                        # LangSmith, no-op if off
     _vector_db      = VectorDBClient()         # connects to Qdrant
     _vector_db.ensure_collection()             # creates collection if absent
     _llm_router     = LLMRouter()              # reads routing config
@@ -378,6 +430,7 @@ async def lifespan(app):
     _retriever      = HybridRetriever(...)     # sets up BM25 + vector
     _reranker       = Reranker()               # loads cross-encoder model
     _context_builder = ContextBuilder()
+    _web_search     = TavilyWebSearch()        # disabled if no API key
     yield
     # cleanup would go here
 ```
@@ -392,6 +445,7 @@ class QueryRequest(BaseModel):
     metadata_filter: dict | None = None   # passed to Qdrant for filtered search
     top_k: int = settings.top_k_rerank    # default 5
     chat_history: list[dict] = []         # multi-turn conversation support
+    web_search: bool | None = None        # None = follow settings.web_search_enabled
 ```
 
 ---
@@ -407,7 +461,7 @@ Before any LLM call is made, the router decides which provider and model to use,
 LLMRouter(routing_mode="balanced")
     │
     ├── _route_for("query_rewrite")
-    │       → ModelRoute(provider="groq", model="llama-3.1-8b-instant", temperature=0.0)
+    │       → ModelRoute(provider="groq", model="openai/gpt-oss-20b", temperature=0.0)
     │
     └── _route_for("rag_answer")
             → routing_mode="cost_optimized" → Groq (free)
@@ -593,6 +647,21 @@ If the cross-encoder model fails to load (no `sentence_transformers` installed, 
 
 ---
 
+### Step 6b — Web Search Fallback
+
+**Files:** `online_pipeline/retrieval/web_search.py` (`TavilyWebSearch`), gate in `gateway._local_recall_is_weak`
+
+The indexed corpus cannot answer everything. Local recall is judged **weak** when either:
+
+- fewer than `web_search_min_local_results` (3) candidates came back, or
+- the best cross-encoder score is below `web_search_min_relevance_score` (0.0 logit).
+
+If the reranker is unavailable there is no absolute score, so only the count rule applies. When weak, Tavily results are normalised to the same `{text, metadata}` shape as local chunks (`file_type: web_search`, `origin: tavily`) and **reranked together with the local candidates** so both compete on one scale. Web search is skipped when there is no `TAVILY_API_KEY`, the SDK is missing, or the request sets `web_search: false`; any Tavily failure degrades to "no web results".
+
+The same helper (`_web_top_up`) is reused as a second trigger after generation grading (Step 9).
+
+---
+
 ### Step 7 — Context Building
 
 **File:** `online_pipeline/context_builder/builder.py`  
@@ -658,7 +727,7 @@ system_prompt = (
     "Cite source numbers [1], [2] where relevant."
 )
 
-LLMClient(provider="groq", model="llama-3.1-8b-instant").complete(system_prompt, user_message)
+LLMClient(provider="groq", model="openai/gpt-oss-20b").complete(system_prompt, user_message)
 ```
 
 **Why `answer ONLY from context`?**  
@@ -680,6 +749,55 @@ dispatch = {
 ```
 
 Each provider method wraps the respective SDK's chat completion API. All providers receive the same `system_prompt` and `user_message`; they differ only in the SDK call structure.
+
+---
+
+### Step 9 — Generation Grading
+
+**Files:** `online_pipeline/grading/grader.py` (`GenerationGrader`, `GradeResult`), `LLMRouter.grade_answer`, loop in `gateway.query()`
+
+Even with "answer ONLY from context" in the prompt, small models still invent details. After each draft a grader LLM (default Groq `openai/gpt-oss-20b`, temperature 0, with the usual provider fallbacks) returns one JSON verdict:
+
+```json
+{"grounded": true, "answers_question": false, "unsupported_claims": []}
+```
+
+- **grounded** — every factual claim is supported by the context (citations like `[1]` are fine; "the context does not say" is grounded).
+- **answers_question** — the answer resolves the question. An honest "I don't know" is grounded but *not* useful, which is exactly what should trigger a web search.
+
+```
+draft = generate(context)
+grade = grade(draft)
+
+while not grounded and attempts < max_generation_attempts:   # default 2 = 1 retry
+    draft = generate(context, feedback=grade.feedback())     # names the unsupported claims
+    grade = grade(draft)
+
+if not (grounded and answers_question) and web allowed and web not yet used:
+    context = rebuild(rerank(local + tavily))                # fresh evidence
+    draft = generate(context, feedback=grade.feedback())     # one last attempt
+    grade = grade(draft)
+
+if not grounded:
+    policy "warn"    → prepend "Note: parts of this answer could not be verified…"
+    policy "abstain" → replace with a refusal
+```
+
+**Why one combined grader call instead of two?** Both verdicts need the same inputs; one call halves latency and cost per attempt.
+
+**Why bounded?** The LangGraph reference loops on "not supported" indefinitely. Here the worst case is 3 generations and 3 grader calls per request.
+
+**Why fail-open?** Grading is a safety net. If every grader provider is down, `grade_answer` returns `None`, the answer is returned as-is and the response carries `grounded: null` so clients can tell it was not checked.
+
+**Cost note:** grading adds at least one extra LLM call per query. Set `ANSWER_GRADING_ENABLED=false` to turn it off.
+
+---
+
+### Observability (LangSmith)
+
+**File:** `online_pipeline/observability/tracing.py`
+
+Every pipeline stage (`query_rewrite`, `embed_query`, `hybrid_retrieve`, `rerank`, `tavily_web_search`, `build_context`, `generate_answer`, `grade_generation`) is wrapped with `@traced`, nested under one `rag_query` run. Tracing activates only when `LANGSMITH_TRACING=true` and a key is set; otherwise the decorator is a transparent no-op, so a missing `langsmith` install costs nothing. Use it to see *which* attempt the grader rejected and why.
 
 ---
 
