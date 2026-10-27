@@ -1,0 +1,25 @@
+# Tenant policy = the ceiling. A user's scopes can never exceed it.
+# Unknown tenants get the most restrictive policy (the built-in defaults below).
+#
+# Effective web search = tenant.allow_web_search AND user scope rag:web
+#                        AND web_search_enabled AND request did not opt out.
+default:
+  allow_web_search: false
+  allow_url_ingest: false
+  url_allowlist: []
+  max_classification: 1
+  require_verified_sources: true
+  ungrounded_answer_policy: abstain   # warn | abstain
+  numeric_mismatch_policy: abstain    # warn | abstain
+
+tenants: {}
+#  equities-research:
+#    allow_web_search: true
+#    allow_url_ingest: true
+#    url_allowlist: [sec.gov]          # host or parent domain; empty = nothing allowed
+#    max_classification: 3
+#    require_verified_sources: false
+#    ungrounded_answer_policy: warn
+#  investment-banking:
+#    allow_web_search: false           # deal confidentiality
+#    max_classification: 3

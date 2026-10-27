@@ -76,9 +76,29 @@ class Settings(BaseSettings):
     grader_model: str = "openai/gpt-oss-20b"
     # Total generation attempts per request: first draft + stricter regenerations.
     max_generation_attempts: int = 2
-    # What to do when the final answer is still not grounded in the context:
-    # "warn" prepends a caveat, "abstain" replaces the answer with a refusal.
-    ungrounded_answer_policy: str = "warn"  # "warn" | "abstain"
+
+    # ── Authentication (Okta) ────────────────────────────────────────────────
+    app_env: str = "dev"              # "dev" | "staging" | "prod"
+    # "okta" validates Okta-issued RS256 access tokens; "dev_token" (HS256) and
+    # "disabled" are honoured only when app_env == "dev".
+    auth_mode: str = "okta"           # "okta" | "dev_token" | "disabled"
+    okta_issuer: str = ""             # e.g. https://acme.okta.com/oauth2/default
+    okta_audience: str = "api://default"
+    okta_jwks_url: str = ""           # defaults to <okta_issuer>/v1/keys
+    okta_scopes_claim: str = "scp"
+    okta_tenant_claim: str = "tenant_id"      # custom claim on the auth server
+    okta_groups_claim: str = "groups"         # custom claim on the auth server
+    okta_clearance_claim: str = "clearance"   # custom claim, integer 0-3
+    jwt_leeway_seconds: int = 30
+    dev_jwt_secret: str = ""          # HS256 secret, dev_token mode only (>= 32 chars)
+    tenant_policies_path: str = "config/tenant_policies.yaml"
+
+    # ── Audit ────────────────────────────────────────────────────────────────
+    audit_log_path: str = "logs/audit.jsonl"
+    # Keys the hash chain and query fingerprints. Required outside dev.
+    audit_hmac_key: str = ""
+    # True: a request fails (503) when its audit event cannot be written.
+    audit_fail_closed: bool = True
 
     # ── Observability (LangSmith) ────────────────────────────────────────────
     langsmith_tracing: bool = False

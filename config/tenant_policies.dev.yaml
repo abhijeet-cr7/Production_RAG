@@ -1,0 +1,13 @@
+# Permissive policy for local development only (TENANT_POLICIES_PATH=config/tenant_policies.dev.yaml).
+default:
+  allow_web_search: false
+  allow_url_ingest: false
+
+tenants:
+  dev:
+    allow_web_search: true
+    allow_url_ingest: true
+    url_allowlist: [sec.gov, wikipedia.org]
+    max_classification: 3
+    require_verified_sources: false
+    ungrounded_answer_policy: warn

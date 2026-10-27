@@ -413,7 +413,16 @@ class TestGradedQueryFlow:
     def _run(self, grades, *, web_hits=None, policy="warn", max_attempts=2, allow_web=True):
         import asyncio
         from online_pipeline.api import gateway
+        from online_pipeline.auth.policy import TenantPolicy, TenantPolicyStore
+        from online_pipeline.auth.principal import Principal
         from online_pipeline.grading.grader import GradeResult
+
+        principal = Principal(
+            user_id="u1", tenant_id="t1", scopes=frozenset({"rag:query", "rag:web"})
+        )
+        store = TenantPolicyStore(tenants={
+            "t1": TenantPolicy(allow_web_search=True, ungrounded_answer_policy=policy),
+        })
 
         grade_iter = iter([GradeResult(*g) if g is not None else None for g in grades])
         generate = MagicMock(side_effect=lambda *a, **k: f"draft{generate.call_count}")
@@ -433,13 +442,15 @@ class TestGradedQueryFlow:
             patch.object(gateway, "_web_search", web_client),
             patch.object(gateway.settings, "web_search_enabled", True),
             patch.object(gateway.settings, "answer_grading_enabled", True),
-            patch.object(gateway.settings, "ungrounded_answer_policy", policy),
+            patch.object(gateway, "_policies", store),
             patch.object(gateway.settings, "max_generation_attempts", max_attempts),
         ]
         for p in patches:
             p.start()
         try:
-            response = asyncio.run(gateway.query(gateway.QueryRequest(query="q")))
+            response = asyncio.run(
+                gateway.query(gateway.QueryRequest(query="q"), principal=principal)
+            )
         finally:
             for p in reversed(patches):
                 p.stop()
