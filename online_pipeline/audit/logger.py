@@ -167,6 +167,43 @@ def verify_chain(path: str | Path, key: bytes) -> VerifyResult:
     return VerifyResult(True, count)
 
 
+def read_events(
+    path: str | Path,
+    tenant: str,
+    *,
+    after_seq: int = 0,
+    limit: int = 100,
+    action: str | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Events of *tenant* with ``seq > after_seq``; returns (events, last seq scanned).
+
+    Streams the file, never loading it whole, and returns only that tenant's rows:
+    system events and other tenants' events are not visible through this API.
+    """
+    events: list[dict[str, Any]] = []
+    last = after_seq
+    try:
+        handle = open(path, "rb")
+    except FileNotFoundError:
+        return [], after_seq
+    with handle:
+        for raw in handle:
+            try:
+                event = json.loads(raw)
+                seq = int(event["seq"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if seq <= after_seq:
+                continue
+            last = seq
+            if event.get("tenant") != tenant or (action and event.get("action") != action):
+                continue
+            events.append(event)
+            if len(events) >= limit:
+                break
+    return events, last
+
+
 # ── process-wide instance and helpers ────────────────────────────────────────
 
 _audit: AuditLog | None = None

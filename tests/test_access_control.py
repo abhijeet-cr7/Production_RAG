@@ -227,6 +227,7 @@ class TestStartupValidation:
         dict(auth_mode="okta", okta_audience=""),
         dict(auth_mode="dev_token", dev_jwt_secret="short"),
         dict(auth_mode="okta", app_env="prod", audit_hmac_key=""),
+        dict(auth_mode="okta", app_env="prod", audit_hmac_key="k", qdrant_api_key=""),   # vector store holds every tenant's data
     ])
     def test_unsafe_config_refuses_to_start(self, overrides):
         with pytest.raises(RuntimeError):
@@ -234,7 +235,8 @@ class TestStartupValidation:
 
     def test_safe_configs_pass(self):
         validate_auth_config(make_settings(auth_mode="disabled"))
-        validate_auth_config(make_settings(auth_mode="okta", app_env="prod", audit_hmac_key="secret"))
+        validate_auth_config(make_settings(auth_mode="okta", app_env="prod", audit_hmac_key="secret",
+                                           qdrant_api_key="qdrant-secret"))
 
 
 # ── Tenant policy ────────────────────────────────────────────────────────────

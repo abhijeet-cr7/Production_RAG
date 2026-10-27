@@ -266,6 +266,64 @@ class VectorDBClient:
             collection_name=self.collection_for_tenant(tenant_id), count_filter=flt, exact=True
         ).count
 
+    def list_documents(
+        self, tenant_id: str | None = None, owner_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """One summary row per document (grouped from its chunks).
+
+        ``tenant_id=None`` spans every tenant (maintenance jobs only; the API always
+        passes a tenant). Includes quarantined and superseded documents, with flags.
+        """
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        must = []
+        if tenant_id is not None:
+            must.append(FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)))
+        if owner_id is not None:
+            must.append(FieldCondition(key="owner_id", match=MatchValue(value=owner_id)))
+        flt = Filter(must=must) if must else None
+
+        documents: dict[tuple[str, str], dict[str, Any]] = {}
+        offset: Any = None
+        while True:
+            batch, offset = self._client.scroll(
+                collection_name=self.collection, scroll_filter=flt, limit=256, offset=offset,
+                with_payload=True, with_vectors=False,
+            )
+            for point in batch:
+                p = point.payload or {}
+                key = (str(p.get("tenant_id")), str(p.get("doc_id")))
+                row = documents.setdefault(key, {
+                    "doc_id": p.get("doc_id"), "tenant_id": p.get("tenant_id"), "source": p.get("source"),
+                    "owner_id": p.get("owner_id"), "classification": p.get("classification"),
+                    "acl_groups": p.get("acl_groups", []), "acl_public": p.get("acl_public"),
+                    "trust_tier": p.get("trust_tier"), "as_of": p.get("as_of"),
+                    "ingested_at": p.get("ingested_at"), "content_sha256": p.get("content_sha256"),
+                    "quarantined": bool(p.get("quarantined")), "superseded": bool(p.get("superseded")),
+                    "legal_hold": bool(p.get("legal_hold")), "chunks": 0,
+                })
+                row["chunks"] += 1
+            if offset is None or not batch:
+                break
+        return list(documents.values())
+
+    def tag_points(self, point_ids: list[str], payload: dict[str, Any]) -> None:
+        """Merge *payload* into specific points (used by the legacy backfill)."""
+        self._client.set_payload(collection_name=self.collection, payload=payload, points=point_ids)
+
+    def iter_payloads(self, page_size: int = 256) -> Any:
+        """Yield (point id, payload) for every point in the collection."""
+        offset: Any = None
+        while True:
+            batch, offset = self._client.scroll(
+                collection_name=self.collection, limit=page_size, offset=offset,
+                with_payload=True, with_vectors=False,
+            )
+            for point in batch:
+                yield str(point.id), dict(point.payload or {})
+            if offset is None or not batch:
+                break
+
     @staticmethod
     def _quarantine_filter(tenant_id: str, doc_id: str | None = None) -> Any:
         from qdrant_client.models import FieldCondition, Filter, MatchValue

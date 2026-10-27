@@ -96,6 +96,44 @@ def build_document_acl(
     )
 
 
+def build_acl_update(
+    actor: Principal,
+    policy: TenantPolicy,
+    *,
+    current: dict[str, Any],
+    is_admin: bool,
+    acl_groups: Iterable[str] | None = None,
+    acl_public: bool | None = None,
+    classification: int | None = None,
+) -> dict[str, Any]:
+    """Validate a change to an existing document's ACL; returns only the fields to set.
+
+    Only what is being changed is validated. Owners may *add* groups they belong to
+    (groups already on the document stay, even if the owner has since left them) and
+    classify up to their own clearance; an administrator may use any group, up to the
+    tenant's classification ceiling. Nobody can classify above the ceiling.
+    """
+    changes: dict[str, Any] = {}
+    if acl_groups is not None:
+        groups = _normalise_groups(acl_groups)
+        allowed = set(current.get("acl_groups") or []) | (set(groups) if is_admin else set(actor.groups))
+        not_held = [g for g in groups if g not in allowed]
+        if not_held:
+            raise ACLError("group_not_held", "You can only share with groups you belong to.")
+        changes["acl_groups"] = groups
+    if acl_public is not None:
+        changes["acl_public"] = bool(acl_public)
+    if classification is not None:
+        if isinstance(classification, bool) or not MIN_CLEARANCE <= classification <= MAX_CLEARANCE:
+            raise ACLError("bad_classification", "classification must be an integer from 0 to 3.")
+        if classification > policy.max_classification:
+            raise ACLError("above_tenant_max", "Classification exceeds your tenant's maximum.")
+        if not is_admin and classification > actor.clearance:
+            raise ACLError("above_clearance", "You cannot classify above your own clearance.")
+        changes["classification"] = classification
+    return changes
+
+
 def _normalise_groups(groups: Iterable[str] | None) -> list[str]:
     seen: dict[str, None] = {}
     for raw in groups or ():

@@ -41,6 +41,12 @@ def configure_tracing() -> bool:
     os.environ["LANGSMITH_ENDPOINT"] = settings.langsmith_endpoint
     os.environ["LANGCHAIN_ENDPOINT"] = settings.langsmith_endpoint
     os.environ["LANGSMITH_PROJECT"] = settings.langsmith_project
+    if settings.langsmith_hide_content:
+        # Keep run names, timings and ids; drop prompts, retrieved text and answers, which
+        # may be confidential and would otherwise leave for a third party.
+        for name in ("LANGSMITH_HIDE_INPUTS", "LANGSMITH_HIDE_OUTPUTS",
+                     "LANGCHAIN_HIDE_INPUTS", "LANGCHAIN_HIDE_OUTPUTS"):
+            os.environ[name] = "true"
     os.environ["LANGCHAIN_PROJECT"] = settings.langsmith_project
 
     logger.info("LangSmith tracing enabled for project '%s'.", settings.langsmith_project)

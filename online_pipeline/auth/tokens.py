@@ -55,6 +55,8 @@ def validate_auth_config(cfg: Settings) -> None:
         raise RuntimeError("DEV_JWT_SECRET must be at least 32 characters for AUTH_MODE=dev_token.")
     if not dev and not cfg.audit_hmac_key:
         raise RuntimeError("AUDIT_HMAC_KEY must be set outside APP_ENV=dev.")
+    if not dev and not cfg.qdrant_api_key:
+        raise RuntimeError("QDRANT_API_KEY must be set outside APP_ENV=dev: the vector store holds every tenant's data.")
 
 
 class TokenValidator:

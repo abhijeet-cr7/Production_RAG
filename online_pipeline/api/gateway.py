@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import hashlib
 import re
+from datetime import datetime, timezone
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
@@ -13,7 +14,7 @@ from typing import AsyncIterator, NamedTuple
 
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query as QueryParam, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -37,8 +38,14 @@ from offline_pipeline.safety.net import SafeFetcher
 from offline_pipeline.safety.sandbox import safe_extract_file
 from offline_pipeline.safety.upload_guard import ALLOWED_EXTENSIONS
 from offline_pipeline.tables.blocks import HEADING, PARAGRAPH, blocks_from_json
-from online_pipeline.audit.logger import AuditError, get_audit, record
-from online_pipeline.auth.acl import ACLError, DocumentACL, authorize, build_document_acl
+from online_pipeline.audit.logger import AuditError, get_audit, read_events, record
+from online_pipeline.auth.acl import (
+    ACLError,
+    DocumentACL,
+    authorize,
+    build_acl_update,
+    build_document_acl,
+)
 from online_pipeline.auth.deps import require_scope
 from online_pipeline.auth.policy import (
     POLICY_DENIALS,
@@ -48,7 +55,7 @@ from online_pipeline.auth.policy import (
     url_host_allowed,
     web_search_decision,
 )
-from online_pipeline.auth.principal import SCOPE_ADMIN, SCOPE_INGEST, SCOPE_QUERY, Principal
+from online_pipeline.auth.principal import SCOPE_ADMIN, SCOPE_AUDIT, SCOPE_INGEST, SCOPE_QUERY, Principal
 from online_pipeline.auth.ratelimit import RateLimiter
 from online_pipeline.auth.tokens import validate_auth_config
 from online_pipeline.answer_safety.advice import REFUSAL as ADVICE_REFUSAL
@@ -56,6 +63,7 @@ from online_pipeline.answer_safety.advice import is_investment_advice_request
 from online_pipeline.answer_safety.sanitize import sanitize_answer
 from online_pipeline.answer_safety.verify import Verification, verify_answer
 from online_pipeline.cache.embedding_cache import EmbeddingCache, embed_text, embed_texts
+from online_pipeline.lifecycle import LegalHold, delete_document_everywhere
 from online_pipeline.provenance.rawstore import RawStore
 from online_pipeline.provenance.trust import (
     Provenance,
@@ -742,6 +750,159 @@ async def ingest_api(
             request.url.strip(), params=request.params, text_fields=request.text_fields
         ),
     )
+
+
+# ── Document management ─────────────────────────────────────────────────────
+
+class DocumentSummary(BaseModel):
+    doc_id: str
+    source: str | None = None
+    owner_id: str | None = None
+    classification: int | None = None
+    acl_groups: list[str] = Field(default_factory=list)
+    acl_public: bool | None = None
+    trust_tier: str | None = None
+    as_of: str | None = None
+    ingested_at: str | None = None
+    content_sha256: str | None = None
+    chunks: int = 0
+    status: str = "active"   # active | quarantined | superseded
+    legal_hold: bool = False
+
+
+class AclUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    acl_groups: list[str] | None = None
+    acl_public: bool | None = None
+    classification: int | None = None
+
+
+class LegalHoldRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    hold: bool
+
+
+def _status_of(doc: dict) -> str:
+    return "quarantined" if doc.get("quarantined") else "superseded" if doc.get("superseded") else "active"
+
+
+async def _managed_document(principal: Principal, doc_id: str) -> dict:
+    """The document's info if *principal* may manage it (owner or tenant admin), else 404.
+
+    A document the caller cannot manage is reported as missing, not forbidden, so the
+    existence of other people's documents is not disclosed.
+    """
+    info = await run_in_threadpool(_vector_db.get_document_info, principal.tenant_id, doc_id)
+    if info is None or (info.get("owner_id") != principal.user_id and not principal.has_scope(SCOPE_ADMIN)):
+        raise HTTPException(status_code=404, detail="No such document.")
+    return info
+
+
+@app.get("/documents", response_model=list[DocumentSummary])
+async def list_documents(
+    all: bool = QueryParam(default=False, description="Tenant-wide listing (administrators only)."),
+    principal: Principal = Depends(require_scope(SCOPE_INGEST)),
+) -> list[DocumentSummary]:
+    """Your own documents with their status, or every document of the tenant for an admin."""
+    if all and not principal.has_scope(SCOPE_ADMIN):
+        raise HTTPException(status_code=403, detail=f"Missing required scope '{SCOPE_ADMIN}'.")
+    rows = await run_in_threadpool(
+        _vector_db.list_documents, principal.tenant_id, None if all else principal.user_id
+    )
+    record("doc.list", actor=principal, count=len(rows), scope="tenant" if all else "own")
+    return [DocumentSummary(**{**r, "status": _status_of(r)}) for r in sorted(rows, key=lambda r: str(r.get("ingested_at")), reverse=True)]
+
+
+@app.patch("/documents/{doc_id}/acl")
+async def update_document_acl(
+    doc_id: str,
+    update: AclUpdate,
+    principal: Principal = Depends(require_scope(SCOPE_INGEST)),
+) -> dict:
+    """Change who can read a document. Takes effect on the very next query.
+
+    Owners may share with groups they belong to and classify up to their own clearance;
+    a tenant administrator may use any group, up to the tenant's classification ceiling.
+    """
+    if update.acl_groups is None and update.acl_public is None and update.classification is None:
+        raise HTTPException(status_code=422, detail="Provide acl_groups, acl_public or classification.")
+    info = await _managed_document(principal, doc_id)
+    is_admin = principal.has_scope(SCOPE_ADMIN)
+    try:
+        changes = build_acl_update(
+            principal, _policy_for(principal), current=info, is_admin=is_admin,
+            acl_groups=update.acl_groups, acl_public=update.acl_public,
+            classification=update.classification,
+        )
+    except ACLError as exc:
+        record("policy.deny", actor=principal, decision="deny", reason="acl_not_permitted",
+               resource={"doc_id": doc_id}, code=exc.code)
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    before = {k: info.get(k) for k in ("acl_groups", "acl_public", "classification")}
+    after = {**{k: info.get(k) for k in before}, **changes}
+    changed = await run_in_threadpool(_vector_db.set_document_payload, principal.tenant_id, doc_id, changes)
+    record("acl.change", actor=principal, resource={"doc_id": doc_id}, chunks=changed, before=before, after=after,
+           by_admin=is_admin and info.get("owner_id") != principal.user_id)
+    return {"doc_id": doc_id, "chunks_updated": changed, **after}
+
+
+@app.delete("/documents/{doc_id}")
+async def delete_document(
+    doc_id: str,
+    principal: Principal = Depends(require_scope(SCOPE_INGEST)),
+) -> dict:
+    """Permanently delete a document: its chunks, and its original bytes if unused elsewhere."""
+    await _managed_document(principal, doc_id)
+    try:
+        result = await run_in_threadpool(
+            delete_document_everywhere, _vector_db, _raw_store, principal.tenant_id, doc_id
+        )
+    except LegalHold as exc:
+        record("policy.deny", actor=principal, decision="deny", reason="legal_hold",
+               resource={"doc_id": doc_id})
+        raise HTTPException(status_code=409, detail="Document is under legal hold and cannot be deleted.") from exc
+    record("doc.delete", actor=principal, resource={"doc_id": doc_id}, **result)
+    await run_in_threadpool(_refresh_lexical_index)
+    return {"doc_id": doc_id, **result}
+
+
+@app.post("/admin/documents/{doc_id}/legal-hold")
+async def set_legal_hold(
+    doc_id: str,
+    body: LegalHoldRequest,
+    principal: Principal = Depends(require_scope(SCOPE_ADMIN)),
+) -> dict:
+    """Place or lift a legal hold. A held document cannot be deleted or purged."""
+    info = await run_in_threadpool(_vector_db.get_document_info, principal.tenant_id, doc_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail="No such document.")
+    payload = {"legal_hold": body.hold}
+    if body.hold:
+        payload |= {"legal_hold_by": principal.user_id, "legal_hold_at": datetime.now(tz=timezone.utc).isoformat()}
+    changed = await run_in_threadpool(_vector_db.set_document_payload, principal.tenant_id, doc_id, payload)
+    record("doc.legal_hold", actor=principal, resource={"doc_id": doc_id}, hold=body.hold, chunks=changed)
+    return {"doc_id": doc_id, "legal_hold": body.hold, "chunks_updated": changed}
+
+
+# ── Audit read (tenant-scoped) ──────────────────────────────────────────────
+
+@app.get("/audit")
+async def read_audit(
+    after_seq: int = QueryParam(default=0, ge=0),
+    limit: int = QueryParam(default=100, ge=1, le=500),
+    action: str | None = QueryParam(default=None, max_length=64),
+    principal: Principal = Depends(require_scope(SCOPE_AUDIT)),
+) -> dict:
+    """Audit events for your own tenant only. Page with ``after_seq=<next_after_seq>``."""
+    events, last = await run_in_threadpool(
+        read_events, settings.audit_log_path, principal.tenant_id,
+        after_seq=after_seq, limit=limit, action=action,
+    )
+    record("audit.read", actor=principal, returned=len(events), after_seq=after_seq, action_filter=action)
+    return {"events": events, "next_after_seq": last}
 
 
 # ── Quarantine review (tenant administrators) ───────────────────────────────

@@ -107,6 +107,10 @@ class Settings(BaseSettings):
     require_citations: bool = True       # figures and answers must cite [n] sources
     answer_verification_enabled: bool = True   # deterministic citation + figure checks
 
+    # ── Document lifecycle ───────────────────────────────────────────────────
+    # Documents older than this are removed by scripts/purge_expired.py (0 = keep).
+    retention_days: int = 0
+
     # ── Authentication (Okta) ────────────────────────────────────────────────
     app_env: str = "dev"              # "dev" | "staging" | "prod"
     # "okta" validates Okta-issued RS256 access tokens; "dev_token" (HS256) and
