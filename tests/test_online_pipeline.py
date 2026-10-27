@@ -169,8 +169,10 @@ class TestHybridRetriever:
     def test_empty_corpus_and_no_vector_db(self):
         from online_pipeline.retrieval.hybrid_retriever import HybridRetriever
         retriever = HybridRetriever()
+        from online_pipeline.auth.principal import Principal
         results = retriever.retrieve(
-            query_text="test", query_vector=[0.1] * 5, top_k=5
+            query_text="test", query_vector=[0.1] * 5,
+            principal=Principal(user_id="u", tenant_id="t"), top_k=5,
         )
         assert results == []
 
@@ -432,7 +434,11 @@ class TestGradedQueryFlow:
         patches = [
             patch.object(gateway, "_stage_rewrite", side_effect=lambda q: q),
             patch.object(gateway, "_stage_embed", return_value=[0.0]),
-            patch.object(gateway, "_stage_retrieve", return_value=[{"text": "t", "metadata": {}}] * 5),
+            patch.object(gateway, "_stage_retrieve", return_value=[
+                {"text": "t", "metadata": {
+                    "tenant_id": "t1", "owner_id": "u1", "acl_groups": [],
+                    "acl_public": False, "classification": 1}}
+            ] * 5),
             patch.object(gateway, "_stage_rerank", side_effect=lambda q, c, k: c[:k]),
             patch.object(gateway, "_local_recall_is_weak", return_value=False),
             patch.object(gateway, "_stage_build_context", return_value="ctx"),

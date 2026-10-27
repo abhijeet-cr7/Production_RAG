@@ -464,7 +464,11 @@ class TestQueryEndpoint:
         stubs = [
             patch.object(g, "_stage_rewrite", side_effect=lambda q: q),
             patch.object(g, "_stage_embed", return_value=[0.0]),
-            patch.object(g, "_stage_retrieve", return_value=[{"text": "t", "metadata": {"doc_id": "d1"}}] * 4),
+            patch.object(g, "_stage_retrieve", return_value=[
+                {"text": "t", "metadata": {
+                    "doc_id": "d1", "tenant_id": tenant, "owner_id": "00u123",
+                    "acl_groups": [], "acl_public": False, "classification": 1}}
+            ] * 4),
             patch.object(g, "_stage_rerank", side_effect=lambda q, c, k: c[:k]),
             patch.object(g, "_stage_build_context", return_value="ctx"),
             patch.object(g, "_stage_generate", return_value="the answer"),

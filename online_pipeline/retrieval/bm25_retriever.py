@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +21,20 @@ class BM25Retriever:
 
     # ── public API ───────────────────────────────────────────────────────────
 
-    def retrieve(self, query: str, top_k: int = 20) -> list[dict[str, Any]]:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 20,
+        predicate: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> list[dict[str, Any]]:
         """Return the top-*k* documents scored by BM25.
 
         Args:
             query: The tokenised search query.
             top_k: Maximum number of results to return.
+            predicate: Optional filter applied *before* the cut to top_k, so the
+                caller still gets top_k permitted documents rather than a
+                result list that filtering emptied.
 
         Returns:
             List of corpus dicts enriched with a ``bm25_score`` key,
@@ -38,13 +46,13 @@ class BM25Retriever:
         tokens = query.lower().split()
         scores: list[float] = self._bm25.get_scores(tokens).tolist()
 
-        ranked = sorted(
-            enumerate(scores), key=lambda x: x[1], reverse=True
-        )[:top_k]
+        ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
 
         results = []
         for idx, score in ranked:
-            if score <= 0:
+            if score <= 0 or len(results) >= top_k:
+                break
+            if predicate is not None and not predicate(self.corpus[idx]):
                 continue
             doc = dict(self.corpus[idx])
             doc["bm25_score"] = score

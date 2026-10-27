@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from config.settings import settings
 from offline_pipeline.chunkers.router import ChunkingStrategyRouter
@@ -24,7 +24,7 @@ from offline_pipeline.extractors.web_extractor import WebExtractor
 from offline_pipeline.preprocessors.cleaner import TextCleaner
 from offline_pipeline.preprocessors.metadata_enricher import MetadataEnricher
 from online_pipeline.audit.logger import AuditError, get_audit, record
-from online_pipeline.auth.acl import ACLError, DocumentACL, build_document_acl
+from online_pipeline.auth.acl import ACLError, DocumentACL, authorize, build_document_acl
 from online_pipeline.auth.deps import require_scope
 from online_pipeline.auth.policy import (
     POLICY_DENIALS,
@@ -55,8 +55,14 @@ _ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 
 
 class QueryRequest(BaseModel):
+    # Unknown fields are rejected, so a caller cannot smuggle in a filter of
+    # their own: the entitlement filter is built server-side from the token.
+    model_config = ConfigDict(extra="forbid")
+
     query: str
-    metadata_filter: dict | None = None
+    # Optional narrowing to named sources; ANDed with the ACL filter, never a
+    # replacement for it.
+    source_in: list[str] | None = None
     top_k: int = settings.top_k_rerank
     chat_history: list[dict] = Field(default_factory=list)
     # None = follow settings.web_search_enabled; True/False force the behaviour.
@@ -371,7 +377,7 @@ async def ingest(
         raise HTTPException(status_code=400, detail="; ".join(f"{r.filename}: {r.detail}" for r in results))
 
     # New chunks are invisible to the lexical branch until the index is rebuilt.
-    _refresh_lexical_index()
+    await run_in_threadpool(_refresh_lexical_index)
 
     return IngestResponse(
         files=results,
@@ -403,7 +409,7 @@ async def ingest_url(
 
     doc_id, chunk_count = _index_document(doc, principal, acl)
     _audit_ingest(principal, "url", request.url, "indexed", doc_id=doc_id, chunks=chunk_count)
-    _refresh_lexical_index()
+    await run_in_threadpool(_refresh_lexical_index)
     return IngestSourceResponse(source=request.url, chunks_indexed=chunk_count, doc_id=doc_id)
 
 
@@ -435,7 +441,7 @@ async def ingest_api(
 
     doc_id, chunk_count = _index_document(doc, principal, acl)
     _audit_ingest(principal, "api", request.url, "indexed", doc_id=doc_id, chunks=chunk_count)
-    _refresh_lexical_index()
+    await run_in_threadpool(_refresh_lexical_index)
     return IngestSourceResponse(source=request.url, chunks_indexed=chunk_count, doc_id=doc_id)
 
 
@@ -457,13 +463,15 @@ def _stage_embed(text: str) -> list[float]:
 def _stage_retrieve(
     query_text: str,
     query_vector: list[float],
-    metadata_filter: dict | None,
+    principal: Principal,
+    source_in: list[str] | None,
 ) -> list[dict]:
     return _retriever.retrieve(
         query_text=query_text,
         query_vector=query_vector,
-        metadata_filter=metadata_filter,
+        principal=principal,
         top_k=settings.top_k_retrieval,
+        source_in=source_in,
     )
 
 
@@ -537,8 +545,9 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
 
     rewritten = _stage_rewrite(request.query)
     embedding = _stage_embed(rewritten)
-    candidates = _stage_retrieve(rewritten, embedding, request.metadata_filter)
-    reranked = _stage_rerank(rewritten, candidates, request.top_k)
+    guard = _AclGuard(principal)
+    candidates = guard.filter(_stage_retrieve(rewritten, embedding, principal, request.source_in))
+    reranked = guard.filter(_stage_rerank(rewritten, candidates, request.top_k))
 
     # Web search must pass the tenant ceiling, the user's scope and the request.
     allowed, deny_reason = web_search_decision(
@@ -555,9 +564,9 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
     web_search_used = False
     if _local_recall_is_weak(candidates, reranked):
         if allow_web:
-            topped_up = _web_top_up(rewritten, candidates, request.top_k)
+            topped_up = _web_top_up(rewritten, candidates, request.top_k, principal)
             if topped_up is not None:
-                reranked, web_search_used = topped_up, True
+                reranked, web_search_used = guard.filter(topped_up), True
         elif deny_reason in POLICY_DENIALS:
             web_denied = deny_reason
 
@@ -585,9 +594,9 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
         # the problem, so fetch fresh evidence and make one last attempt.
         if grade is not None and not grade.acceptable and not web_search_used:
             if allow_web:
-                topped_up = _web_top_up(rewritten, candidates, request.top_k)
+                topped_up = _web_top_up(rewritten, candidates, request.top_k, principal)
                 if topped_up is not None:
-                    reranked, web_search_used = topped_up, True
+                    reranked, web_search_used = guard.filter(topped_up), True
                     context = _stage_build_context(reranked)
                     answer = _stage_generate(
                         request.query, context, request.chat_history, grade.feedback()
@@ -600,6 +609,17 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
         if grade is not None and not grade.grounded:
             answer = _apply_ungrounded_policy(answer, policy)
             ungrounded_policy_applied = True
+
+    if guard.dropped:
+        # The pre-filter should have made this impossible: treat as an incident.
+        record(
+            "acl.guard_dropped",
+            actor=principal,
+            decision="deny",
+            reason="prefilter_bypass_suspected",
+            resource="retrieval",
+            dropped=guard.dropped,
+        )
 
     if web_denied:
         record(
@@ -622,6 +642,7 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
     audit_details = {
         "returned_doc_ids": [m["doc_id"] for m in sources if m.get("doc_id")][:50],
         "n_sources": len(sources),
+        "guard_dropped": guard.dropped,
         "web_used": web_search_used,
         "web_denied": web_denied,
         "grounded": response.grounded,
@@ -632,12 +653,49 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
     return response, audit_details
 
 
-def _web_top_up(query: str, candidates: list[dict], top_k: int) -> list[dict] | None:
+def _web_top_up(
+    query: str, candidates: list[dict], top_k: int, principal: Principal
+) -> list[dict] | None:
     """Rerank local candidates together with web hits; None when the web gave nothing."""
     web_results = _stage_web_search(query)
     if not web_results:
         return None
-    return _stage_rerank(query, candidates + web_results, top_k)
+    return _stage_rerank(query, candidates + _stamp_web_acl(web_results, principal), top_k)
+
+
+def _stamp_web_acl(results: list[dict], principal: Principal) -> list[dict]:
+    """Give web hits an explicit ACL: public to the caller's own tenant only.
+
+    They are public by construction, but stamping them (rather than exempting
+    them) means the guard runs the same rule over every chunk, whatever its origin.
+    """
+    for hit in results:
+        hit.setdefault("metadata", {}).update(
+            tenant_id=principal.tenant_id,
+            owner_id="web",
+            acl_groups=[],
+            acl_public=True,
+            classification=0,
+        )
+    return results
+
+
+class _AclGuard:
+    """Second enforcement layer: drop anything the principal may not read.
+
+    The vector store already pre-filters, so a non-zero count here means a
+    filter was bypassed or a new retriever skipped it. That is audited as an
+    anomaly, never silently absorbed.
+    """
+
+    def __init__(self, principal: Principal) -> None:
+        self.principal = principal
+        self.dropped = 0
+
+    def filter(self, chunks: list[dict]) -> list[dict]:
+        allowed, dropped = authorize(chunks, self.principal)
+        self.dropped += dropped
+        return allowed
 
 
 def _apply_ungrounded_policy(answer: str, policy: TenantPolicy) -> str:

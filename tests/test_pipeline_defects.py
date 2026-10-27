@@ -168,6 +168,15 @@ class TestWorkerPointIdentity:
 
 # ── Defect 4: BM25 was never constructed, so "hybrid" was dense-only ─────────
 
+ACL = {"tenant_id": "t1", "owner_id": "u1", "acl_groups": [], "acl_public": True, "classification": 0}
+
+
+def _reader():
+    from online_pipeline.auth.principal import Principal
+
+    return Principal(user_id="reader", tenant_id="t1", clearance=1)
+
+
 class TestLexicalBranchRuns:
     def test_retriever_starts_dense_only(self):
         from online_pipeline.retrieval.hybrid_retriever import HybridRetriever
@@ -181,9 +190,9 @@ class TestLexicalBranchRuns:
         retriever = HybridRetriever()
         retriever.load_corpus([
             {"text": "net sales rose on Services revenue",
-             "metadata": {"doc_id": "A", "chunk_index": 0}},
+             "metadata": {"doc_id": "A", "chunk_index": 0, **ACL}},
             {"text": "CUSIP 037833100 term sheet",
-             "metadata": {"doc_id": "B", "chunk_index": 0}},
+             "metadata": {"doc_id": "B", "chunk_index": 0, **ACL}},
         ])
         assert retriever.lexical_enabled is True
 
@@ -196,17 +205,19 @@ class TestLexicalBranchRuns:
         # one of two documents, so a toy corpus scores every match at zero.
         corpus = [
             {"text": f"commentary on segment margins for period {i}",
-             "metadata": {"doc_id": "C", "chunk_index": i}}
+             "metadata": {"doc_id": "C", "chunk_index": i, **ACL}}
             for i in range(30)
         ]
         corpus.append({
             "text": "CUSIP 037833100 appears in the term sheet",
-            "metadata": {"doc_id": "B", "chunk_index": 0},
+            "metadata": {"doc_id": "B", "chunk_index": 0, **ACL},
         })
 
         retriever = HybridRetriever()
         retriever.load_corpus(corpus)
         # No vector branch at all: anything returned came from BM25.
-        results = retriever.retrieve(query_text="037833100", query_vector=[], top_k=5)
+        results = retriever.retrieve(
+            query_text="037833100", query_vector=[], principal=_reader(), top_k=5
+        )
         assert results, "the lexical branch returned nothing for an exact token match"
         assert results[0]["metadata"]["doc_id"] == "B"

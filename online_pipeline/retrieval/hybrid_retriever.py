@@ -1,9 +1,18 @@
-"""Hybrid retriever: fuses BM25 and vector search via Reciprocal Rank Fusion."""
+"""Hybrid retriever: fuses BM25 and vector search via Reciprocal Rank Fusion.
+
+Every retrieval is entitlement-filtered. The vector branch pre-filters inside
+the store; the lexical branch keeps one BM25 index *per tenant* (so another
+tenant's documents can neither appear nor skew IDF) and applies the same ACL
+rule before ranking, then re-checks hits against the store's current payload.
+"""
 
 from __future__ import annotations
 
 import logging
 from typing import Any
+
+from online_pipeline.auth.acl import is_authorized
+from online_pipeline.auth.principal import Principal
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +22,7 @@ class HybridRetriever:
 
     Args:
         vector_db: A :class:`~vector_db.client.VectorDBClient` (used for
-            the vector branch).
+            the vector branch and to re-validate lexical hits).
         corpus: In-memory document list for BM25 (may be ``None`` to skip).
         bm25_weight: Weight given to BM25 scores in the fusion step.
         vector_weight: Weight given to vector scores in the fusion step.
@@ -32,8 +41,9 @@ class HybridRetriever:
         self.vector_weight = vector_weight
         self.rrf_k = rrf_k
 
+        self._vector_db = vector_db
         self._vector_retriever = None
-        self._bm25_retriever = None
+        self._bm25_by_tenant: dict[str, Any] = {}
 
         if vector_db is not None:
             from online_pipeline.retrieval.vector_retriever import VectorRetriever
@@ -45,48 +55,67 @@ class HybridRetriever:
     # ── public API ───────────────────────────────────────────────────────────
 
     def load_corpus(self, corpus: list[dict[str, Any]]) -> None:
-        """Build (or rebuild) the BM25 index over *corpus*.
+        """Build (or rebuild) one BM25 index per tenant over *corpus*.
 
+        Documents without a ``tenant_id`` are not indexed at all (default deny).
         The lexical branch is only live once this has been called with a
         non-empty corpus; until then ``retrieve`` is dense-only. Call it again
         after ingesting to bring new chunks into lexical range.
 
-        Note: this index is held in memory and scores every document per query.
-        That is fine up to tens of thousands of chunks; past that the lexical
-        branch belongs in the store as sparse vectors.
+        Note: indexes are held in memory and score every document of the
+        caller's tenant per query. That is fine up to tens of thousands of
+        chunks; past that the lexical branch belongs in the store as sparse
+        vectors.
         """
-        if not corpus:
-            self._bm25_retriever = None
-            return
+        by_tenant: dict[str, list[dict[str, Any]]] = {}
+        skipped = 0
+        for doc in corpus:
+            tenant = (doc.get("metadata") or {}).get("tenant_id")
+            if not isinstance(tenant, str) or not tenant:
+                skipped += 1
+                continue
+            by_tenant.setdefault(tenant, []).append(doc)
+        if skipped:
+            logger.warning("BM25: skipped %d chunk(s) with no tenant_id.", skipped)
+
         from online_pipeline.retrieval.bm25_retriever import BM25Retriever
 
-        try:
-            self._bm25_retriever = BM25Retriever(corpus)
-            logger.info("BM25 index built over %d chunks.", len(corpus))
-        except Exception as exc:  # noqa: BLE001
-            # A missing rank-bm25 install must not take the dense branch down.
-            logger.warning("BM25 index unavailable (%s); retrieval is dense-only.", exc)
-            self._bm25_retriever = None
+        indexes: dict[str, Any] = {}
+        for tenant, docs in by_tenant.items():
+            try:
+                indexes[tenant] = BM25Retriever(docs)
+            except Exception as exc:  # noqa: BLE001
+                # A missing rank-bm25 install must not take the dense branch down.
+                logger.warning("BM25 index unavailable (%s); retrieval is dense-only.", exc)
+                indexes = {}
+                break
+        # Swap in one assignment so a concurrent query sees the old or new set,
+        # never a half-built one.
+        self._bm25_by_tenant = indexes
+        if indexes:
+            logger.info("BM25 indexes built for %d tenant(s).", len(indexes))
 
     @property
     def lexical_enabled(self) -> bool:
         """True when the BM25 branch is live and will contribute to fusion."""
-        return self._bm25_retriever is not None
+        return bool(self._bm25_by_tenant)
 
     def retrieve(
         self,
         query_text: str,
         query_vector: list[float],
+        principal: Principal,
         top_k: int = 20,
-        metadata_filter: dict[str, Any] | None = None,
+        source_in: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Run hybrid retrieval and return fused, de-duplicated results.
+        """Run hybrid retrieval for *principal* and return fused, de-duplicated results.
 
         Args:
             query_text: Rewritten query text (for BM25).
             query_vector: Dense embedding of the query (for vector search).
+            principal: The caller; only chunks they may read are returned.
             top_k: Number of results to return after fusion.
-            metadata_filter: Optional payload filter for the vector branch.
+            source_in: Optional sources to narrow to. Never widens access.
 
         Returns:
             List of result dicts sorted by descending RRF score.
@@ -94,19 +123,68 @@ class HybridRetriever:
         bm25_results: list[dict[str, Any]] = []
         vector_results: list[dict[str, Any]] = []
 
-        if self._bm25_retriever is not None:
-            bm25_results = self._bm25_retriever.retrieve(query_text, top_k=top_k)
+        index = self._bm25_by_tenant.get(principal.tenant_id)
+        if index is not None:
+            hits = index.retrieve(
+                query_text,
+                top_k=top_k,
+                predicate=lambda doc: self._permitted(doc, principal, source_in),
+            )
+            bm25_results = self._revalidate(hits, principal, source_in)
 
         # An empty vector is a lexical-only query, not a zero-dimension search:
         # forwarding it would have the store reject the whole request.
         if self._vector_retriever is not None and query_vector:
             vector_results = self._vector_retriever.retrieve(
-                query_vector, top_k=top_k, metadata_filter=metadata_filter
+                query_vector, principal, top_k=top_k, source_in=source_in
             )
 
         return self._rrf_fuse(bm25_results, vector_results, top_k)
 
     # ── private helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _permitted(
+        doc: dict[str, Any], principal: Principal, source_in: list[str] | None
+    ) -> bool:
+        metadata = doc.get("metadata") or {}
+        if not is_authorized(metadata, principal):
+            return False
+        return not source_in or metadata.get("source") in source_in
+
+    def _revalidate(
+        self,
+        hits: list[dict[str, Any]],
+        principal: Principal,
+        source_in: list[str] | None,
+    ) -> list[dict[str, Any]]:
+        """Re-check lexical hits against the store's *current* payloads.
+
+        The BM25 index is a snapshot. Without this, a document whose ACL was
+        just narrowed or that was just deleted would keep matching until the
+        next rebuild. Fails closed: if the store cannot be read, the lexical
+        branch contributes nothing for this request.
+        """
+        if self._vector_db is None or not hits:
+            return hits
+        ids = [h["id"] for h in hits if h.get("id")]
+        try:
+            fresh = self._vector_db.fetch_payloads(ids)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not re-validate lexical hits (%s); dropping them.", exc)
+            return []
+
+        checked = []
+        for hit in hits:
+            payload = fresh.get(hit.get("id", ""))
+            if payload is None:  # deleted since the index was built, or no id
+                continue
+            payload = dict(payload)
+            payload.pop("text", None)
+            current = dict(hit, metadata=payload)
+            if self._permitted(current, principal, source_in):
+                checked.append(current)
+        return checked
 
     def _rrf_fuse(
         self,

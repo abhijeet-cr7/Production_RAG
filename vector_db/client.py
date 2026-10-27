@@ -11,6 +11,8 @@ import uuid
 from typing import Any
 
 from config.settings import settings
+from online_pipeline.auth.acl import build_qdrant_filter
+from online_pipeline.auth.principal import Principal
 
 logger = logging.getLogger(__name__)
 
@@ -118,29 +120,24 @@ class VectorDBClient:
     def search(
         self,
         vector: list[float],
-        top_k: int = 20,
-        metadata_filter: dict[str, Any] | None = None,
+        top_k: int,
+        principal: Principal,
+        source_in: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Return the *top_k* nearest neighbours for *vector*.
+        """Return the *top_k* nearest neighbours *principal* is entitled to read.
 
-        Args:
-            vector: Query embedding.
-            top_k: Number of results.
-            metadata_filter: Optional Qdrant filter dict (e.g.
-                ``{"must": [{"key": "source", "match": {"value": "x"}}]}``).
+        The entitlement filter is built here from the principal, never accepted
+        from a caller, and ``principal`` has no default: no code path can run an
+        unfiltered search. ``source_in`` can only narrow the result further.
 
         Returns:
             List of dicts with keys ``text``, ``metadata``, and ``score``.
         """
-        from qdrant_client.models import Filter
-
-        qdrant_filter = Filter(**metadata_filter) if metadata_filter else None
-
         hits = self._client.search(
-            collection_name=self.collection,
+            collection_name=self.collection_for_tenant(principal.tenant_id),
             query_vector=vector,
             limit=top_k,
-            query_filter=qdrant_filter,
+            query_filter=build_qdrant_filter(principal, source_in),
             with_payload=True,
         )
         results = []
@@ -148,9 +145,26 @@ class VectorDBClient:
             payload = dict(hit.payload or {})
             text = payload.pop("text", "")
             results.append(
-                {"text": text, "metadata": payload, "score": hit.score}
+                {"id": str(hit.id), "text": text, "metadata": payload, "score": hit.score}
             )
         return results
+
+    def fetch_payloads(self, point_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Current payload for each existing point; deleted points are absent.
+
+        The lexical index is a snapshot, so its hits are re-checked against this
+        authoritative copy: a revoked ACL or a deleted document stops matching
+        immediately instead of after the next index rebuild.
+        """
+        if not point_ids:
+            return {}
+        points = self._client.retrieve(
+            collection_name=self.collection,
+            ids=point_ids,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return {str(p.id): dict(p.payload or {}) for p in points}
 
     def scroll_all(self, limit: int = 50_000, page_size: int = 256) -> list[dict[str, Any]]:
         """Read up to *limit* stored chunks back out of the collection.
@@ -160,7 +174,7 @@ class VectorDBClient:
         arrive in one response.
 
         Returns:
-            List of dicts with keys ``text`` and ``metadata``.
+            List of dicts with keys ``id``, ``text`` and ``metadata``.
         """
         records: list[dict[str, Any]] = []
         offset: Any = None
@@ -176,7 +190,7 @@ class VectorDBClient:
                 payload = dict(point.payload or {})
                 text = payload.pop("text", "")
                 if text:
-                    records.append({"text": text, "metadata": payload})
+                    records.append({"id": str(point.id), "text": text, "metadata": payload})
             if offset is None or not batch:
                 break
         return records
