@@ -1,7 +1,7 @@
 import { useState, useRef } from 'react'
 import { authHeaders } from '../auth'
 
-const ALLOWED = ['.pdf', '.docx', '.txt']
+const ALLOWED = ['.pdf', '.docx', '.txt', '.html', '.htm', '.xml', '.xbrl']
 
 export default function QueryPanel() {
   const [query, setQuery] = useState('')
@@ -186,7 +186,7 @@ export default function QueryPanel() {
           <input
             ref={fileInputRef}
             type="file"
-            accept=".pdf,.docx,.txt"
+            accept=".pdf,.docx,.txt,.html,.htm,.xml,.xbrl"
             multiple
             style={{ display: 'none' }}
             onChange={e => { if (e.target.files.length) attachFiles(e.target.files); e.target.value = '' }}

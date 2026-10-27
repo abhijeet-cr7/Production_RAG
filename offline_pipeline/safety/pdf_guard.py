@@ -17,6 +17,18 @@ from pathlib import Path
 from typing import Any
 
 from offline_pipeline.safety.errors import UnsafeContent
+from offline_pipeline.tables.blocks import (
+    PARAGRAPH,
+    TABLE,
+    Block,
+    Table,
+    blocks_to_json,
+    blocks_to_text,
+    infer_header_rows,
+    trim_grid,
+)
+from offline_pipeline.tables.numbers import detect_units
+from offline_pipeline.tables.pdf_tables import detect_numeric_tables
 
 logger = logging.getLogger(__name__)
 
@@ -225,47 +237,165 @@ def _covered_by_dark_rect(char: dict[str, Any], rects: list[dict[str, Any]]) -> 
 def extract_pdf(
     path: Path, *, max_pages: int, max_chars: int, ocr_max_pages: int
 ) -> dict[str, Any]:
-    """Inspect then extract; returns ``{"text", "metadata"}`` of *visible* text only."""
+    """Inspect then extract; returns ``{"text", "metadata", "blocks"}`` of *visible* content.
+
+    Tables are returned as table blocks (never flattened into prose) and the page
+    text between them as paragraph blocks, in reading order.
+    """
     reader = inspect_pdf(path, max_pages=max_pages)
     page_count = len(reader.pages)
 
-    pages: list[str] = []
+    blocks: list[Block] = []
     hidden_removed = 0
     ocr_pages = 0
+    tables_found = 0
     total = 0
     try:
         import pdfplumber
     except ImportError:  # fall back to pypdf text, without hidden-text filtering
         pdfplumber = None  # type: ignore[assignment]
-        logger.warning("pdfplumber not installed; hidden-text filtering is off.")
+        logger.warning("pdfplumber not installed; hidden-text filtering and tables are off.")
 
     plumber = pdfplumber.open(str(path)) if pdfplumber is not None else None
     try:
         for index in range(page_count):
-            text, removed = _page_text(reader, plumber, index)
+            page_blocks, removed = _page_blocks(reader, plumber, index)
             hidden_removed += removed
-            if not text.strip() and ocr_pages < ocr_max_pages:
+            if not any(b.kind == PARAGRAPH and b.text.strip() or b.kind == TABLE for b in page_blocks) \
+                    and ocr_pages < ocr_max_pages:
                 ocr_text = _ocr_page(reader.pages[index])
                 if ocr_text.strip():
                     ocr_pages += 1
-                    text = ocr_text
-            total += len(text) + 1
+                    page_blocks = [Block(kind=PARAGRAPH, text=ocr_text, page=index + 1)]
+            tables_found += sum(1 for b in page_blocks if b.kind == TABLE)
+            total += sum(len(b.text) for b in page_blocks) + blocks_text_len(page_blocks)
             if total > max_chars:
                 raise UnsafeContent("text_too_large", "Extracted text is too large.")
-            pages.append(text)
+            blocks.extend(page_blocks)
     finally:
         if plumber is not None:
             plumber.close()
 
     return {
-        "text": "\n".join(pages),
+        "text": blocks_to_text(blocks),
         "metadata": {
             "file_type": "pdf",
             "page_count": page_count,
             "hidden_chars_removed": hidden_removed,
             "ocr_pages": ocr_pages,
+            "tables_found": tables_found,
         },
+        "blocks": blocks_to_json(blocks),
     }
+
+
+def blocks_text_len(blocks: list[Block]) -> int:
+    return sum(len(c) for b in blocks if b.table for row in b.table.header_rows + b.table.rows for c in row)
+
+
+def _visible_filter(page: Any, counter: list[int]) -> Any:
+    rects = [
+        r for r in (page.rects or [])[:2000]
+        if r.get("fill") and not _is_white(r.get("non_stroking_color"))
+    ]
+    x0, top, x1, bottom = page.bbox
+
+    def visible(obj: dict[str, Any]) -> bool:
+        if obj.get("object_type") != "char":
+            return True
+        tiny = obj.get("size", 10) < 2
+        off_page = obj["x1"] < x0 - 1 or obj["x0"] > x1 + 1 or obj["bottom"] < top - 1 or obj["top"] > bottom + 1
+        white = _is_white(obj.get("non_stroking_color")) and not _covered_by_dark_rect(obj, rects)
+        if tiny or off_page or white:
+            counter[0] += 1
+            return False
+        return True
+
+    return visible
+
+
+def _numeric_cells(row: list[str]) -> int:
+    from offline_pipeline.tables.numbers import parse_cell_number
+
+    return sum(1 for cell in row[1:] if cell and parse_cell_number(cell) is not None)
+
+
+def _find_tables(page: Any) -> list[tuple[tuple[float, float, float, float], list[list[str]]]]:
+    """(bbox, grid) for each table: ruled tables, plus borderless numeric ones elsewhere on the page."""
+    found = []
+    for table in page.find_tables():
+        grid = trim_grid(table.extract())
+        if len(grid) >= 2 and len(grid[0]) >= 2:
+            found.append((table.bbox, grid))
+
+    words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False) or []
+
+    def inside_ruled(word: dict[str, Any]) -> bool:
+        return any(x0 - 1 <= word["x0"] and word["x1"] <= x1 + 1 and top - 1 <= word["top"] and word["bottom"] <= bottom + 1
+                   for (x0, top, x1, bottom), _ in found)
+
+    loose = [w for w in words if not inside_ruled(w)]
+    if sum(1 for w in loose if any(ch.isdigit() for ch in w["text"])) >= 9:
+        found.extend((bbox, trim_grid(grid)) for bbox, grid in detect_numeric_tables(loose))
+    return found
+
+
+def _grid_to_table(grid: list[list[str]], caption: str, page_no: int, low_confidence: bool) -> Table:
+    header_rows, body = infer_header_rows(grid)
+    scale, currency = detect_units(caption, *(" ".join(r) for r in header_rows[:2]))
+    return Table(
+        caption=caption, header_rows=header_rows, rows=body, scale=scale, currency=currency,
+        page=page_no, confidence="low" if low_confidence else "high",
+    )
+
+
+def _page_blocks(reader: Any, plumber: Any, index: int) -> tuple[list[Block], int]:
+    page_no = index + 1
+    if plumber is None:
+        text = reader.pages[index].extract_text() or ""
+        return ([Block(kind=PARAGRAPH, text=text, page=page_no)] if text.strip() else []), 0
+    try:
+        page = plumber.pages[index]
+        counter = [0]
+        visible_page = page.filter(_visible_filter(page, counter))
+        tables = sorted(_find_tables(visible_page), key=lambda t: t[0][1])
+
+        px0, ptop, px1, pbottom = page.bbox
+        blocks: list[Block] = []
+        cursor = ptop
+        for bbox, grid in tables:
+            x0, top, x1, bottom = bbox
+            top, bottom = max(ptop, top), min(pbottom, bottom)
+            caption = ""
+            if top - cursor > 2:
+                above = _crop_text(visible_page, (px0, cursor, px1, top))
+                lines = [ln.strip() for ln in above.splitlines() if ln.strip()]
+                if lines and len(lines[-1]) < 160 and len(lines[-1].split()) >= 2:
+                    caption = lines[-1]
+                text = "\n".join(lines[:-1] if caption else lines)
+                if text.strip():
+                    blocks.append(Block(kind=PARAGRAPH, text=text, page=page_no))
+            blocks.append(Block(kind=TABLE, table=_grid_to_table(grid, caption, page_no, False), page=page_no))
+            cursor = max(cursor, bottom)
+        if pbottom - cursor > 2 or not tables:
+            tail = _crop_text(visible_page, (px0, cursor, px1, pbottom)) if tables else (visible_page.extract_text() or "")
+            if tail.strip():
+                blocks.append(Block(kind=PARAGRAPH, text=tail, page=page_no))
+        return blocks, counter[0]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("pdfplumber failed on page %d (%s); using pypdf.", page_no, type(exc).__name__)
+        text = reader.pages[index].extract_text() or ""
+        return ([Block(kind=PARAGRAPH, text=text, page=page_no)] if text.strip() else []), 0
+
+
+def _crop_text(page: Any, bbox: tuple[float, float, float, float]) -> str:
+    x0, top, x1, bottom = bbox
+    if bottom - top <= 0:
+        return ""
+    # within_bbox keeps only characters fully inside the band. crop() would also
+    # keep any character merely touching the edge, pulling a table's header line
+    # into the text above it and its last row into the text below.
+    return page.within_bbox((x0, top, x1, bottom)).extract_text() or ""
 
 
 def _page_text(reader: Any, plumber: Any, index: int) -> tuple[str, int]:

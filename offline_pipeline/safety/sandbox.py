@@ -57,7 +57,24 @@ def safe_extract_file(
     """
     path = Path(path)
     kind = check_upload(path, suffix)
+    return run_worker(
+        kind, path, timeout=timeout, cpu_seconds=cpu_seconds, max_memory_mb=max_memory_mb,
+        max_pages=max_pages, max_chars=max_chars, ocr_max_pages=ocr_max_pages,
+    )
 
+
+def run_worker(
+    kind: str,
+    path: Path,
+    *,
+    timeout: float = 120.0,
+    cpu_seconds: int = 110,
+    max_memory_mb: int = 1024,
+    max_pages: int = 500,
+    max_chars: int = 5_000_000,
+    ocr_max_pages: int = 20,
+) -> dict[str, Any]:
+    """Parse *path* as *kind* (pdf, docx, txt, html, xbrl) inside the sandbox."""
     cmd = [
         sys.executable, "-I", str(_WORKER), kind, str(path),
         str(cpu_seconds), str(max_memory_mb), str(max_pages), str(max_chars), str(ocr_max_pages),
@@ -102,5 +119,7 @@ def safe_extract_file(
         raise UnsafeContent(str(result.get("code", "parser_error")), str(result.get("detail", "Rejected.")))
     doc = result.get("doc")
     if not isinstance(doc, dict) or not isinstance(doc.get("text"), str):
+        raise UnsafeContent("parser_crashed", "The document could not be parsed safely.")
+    if "blocks" in doc and not (isinstance(doc["blocks"], list) and all(isinstance(b, dict) for b in doc["blocks"])):
         raise UnsafeContent("parser_crashed", "The document could not be parsed safely.")
     return doc

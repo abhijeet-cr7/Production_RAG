@@ -14,6 +14,19 @@ from typing import Any
 
 from offline_pipeline.safety.errors import UnsafeContent
 from offline_pipeline.safety.xml_guard import safe_fromstring
+from offline_pipeline.tables.blocks import (
+    HEADING,
+    MAX_TABLE_CELLS,
+    PARAGRAPH,
+    TABLE,
+    Block,
+    Table,
+    blocks_to_json,
+    blocks_to_text,
+    infer_header_rows,
+    trim_grid,
+)
+from offline_pipeline.tables.numbers import detect_units
 
 MAX_ENTRIES = 5000
 MAX_TOTAL_UNCOMPRESSED = 200 * 1024 * 1024
@@ -86,25 +99,94 @@ def _check_relationships(root: Any) -> None:
 
 
 def extract_docx(path: Path, *, max_chars: int) -> dict[str, Any]:
-    """Return the visible paragraph text of a (previously inspected) DOCX."""
+    """Return visible paragraphs, headings and tables of a (previously inspected) DOCX, in order."""
     from docx import Document
+    from docx.table import Table as DocxTable
+    from docx.text.paragraph import Paragraph
 
     inspect_docx(path)
     document = Document(str(path))
-    parts: list[str] = []
+    blocks: list[Block] = []
     total = 0
     hidden = 0
-    for paragraph in document.paragraphs:
-        text = _visible_text(paragraph)
-        hidden += _hidden_run_count(paragraph)
-        total += len(text) + 1
+    cells_seen = 0
+    for child in document.element.body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            paragraph = Paragraph(child, document)
+            text = _visible_text(paragraph)
+            hidden += _hidden_run_count(paragraph)
+            if not text.strip():
+                continue
+            style = (paragraph.style.name if paragraph.style is not None else "") or ""
+            level = _heading_level(style)
+            blocks.append(Block(kind=HEADING if level else PARAGRAPH, text=text, level=level))
+            total += len(text) + 1
+        elif tag == "tbl":
+            grid, seen, table_hidden = _table_grid(DocxTable(child, document))
+            cells_seen += seen
+            hidden += table_hidden
+            if cells_seen > MAX_TABLE_CELLS:
+                raise UnsafeContent("table_too_large", "Document tables have too many cells.")
+            grid = trim_grid(grid)
+            if len(grid) >= 2:
+                header_rows, body = infer_header_rows(grid)
+                scale, currency = detect_units(" ".join(" ".join(r) for r in header_rows[:2]))
+                blocks.append(Block(kind=TABLE, table=Table(
+                    header_rows=header_rows, rows=body, scale=scale, currency=currency)))
+                total += sum(len(c) for row in grid for c in row)
         if total > max_chars:
             raise UnsafeContent("text_too_large", "Extracted text is too large.")
-        parts.append(text)
+
+    # A short paragraph just above a table is its caption.
+    for i, block in enumerate(blocks[:-1]):
+        nxt = blocks[i + 1]
+        if (block.kind == PARAGRAPH and nxt.kind == TABLE and nxt.table is not None
+                and not nxt.table.caption and len(block.text) < 160):
+            nxt.table.caption = block.text
+            scale, currency = detect_units(block.text)
+            nxt.table.scale = nxt.table.scale or scale
+            nxt.table.currency = nxt.table.currency or currency
+            block.text = ""
+    blocks = [b for b in blocks if b.kind != PARAGRAPH or b.text]
     return {
-        "text": "\n".join(parts),
+        "text": blocks_to_text(blocks),
         "metadata": {"file_type": "docx", "hidden_runs_removed": hidden},
+        "blocks": blocks_to_json(blocks),
     }
+
+
+def _heading_level(style_name: str) -> int:
+    name = style_name.lower()
+    if name == "title":
+        return 1
+    if name.startswith("heading"):
+        digits = "".join(ch for ch in name if ch.isdigit())
+        return min(6, max(1, int(digits))) if digits else 1
+    return 0
+
+
+def _table_grid(table: Any) -> tuple[list[list[str]], int, int]:
+    """Rows of visible cell text; a merged cell appears once, not once per column it spans."""
+    grid: list[list[str]] = []
+    count = 0
+    hidden = 0
+    for row in table.rows:
+        cells: list[str] = []
+        previous = None
+        for cell in row.cells:
+            count += 1
+            if cell._tc is previous:   # horizontally merged: same underlying cell
+                cells.append("")
+                continue
+            previous = cell._tc
+            texts = []
+            for paragraph in cell.paragraphs:
+                texts.append(_visible_text(paragraph))
+                hidden += _hidden_run_count(paragraph)
+            cells.append(" ".join(t for t in texts if t))
+        grid.append(cells)
+    return grid, count, hidden
 
 
 def _run_is_hidden(run: Any) -> bool:

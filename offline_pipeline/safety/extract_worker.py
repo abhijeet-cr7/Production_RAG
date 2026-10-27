@@ -59,6 +59,10 @@ def main(argv: list[str]) -> int:
             from offline_pipeline.safety.upload_guard import extract_text_file
 
             doc = extract_text_file(path, max_chars=max_chars)
+        elif kind in ("html", "xbrl"):
+            from offline_pipeline.safety.markup_guard import extract_markup
+
+            doc = extract_markup(path, kind=kind, max_chars=max_chars)
         else:
             raise UnsafeContent("unsupported_type", "Unsupported file type.")
         result = {"ok": True, "doc": doc}

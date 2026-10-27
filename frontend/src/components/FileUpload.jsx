@@ -1,7 +1,7 @@
 import { useState, useRef } from 'react'
 import { authHeaders } from '../auth'
 
-const ALLOWED = ['.pdf', '.docx', '.txt']
+const ALLOWED = ['.pdf', '.docx', '.txt', '.html', '.htm', '.xml', '.xbrl']
 
 // quarantined = stored but hidden until an administrator reviews it;
 // rejected = failed a security check and was not stored.
@@ -122,7 +122,7 @@ export default function FileUpload() {
         <input
           ref={inputRef}
           type="file"
-          accept=".pdf,.docx,.txt"
+          accept=".pdf,.docx,.txt,.html,.htm,.xml,.xbrl"
           multiple
           style={{ display: 'none' }}
           onChange={e => { if (e.target.files.length) addFiles(e.target.files); e.target.value = '' }}

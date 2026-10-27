@@ -47,3 +47,28 @@ def build_pdf(
 
 def text_block(text: str, *, size: int = 12, x: int = 72, y: int = 700, color: str = "0 0 0") -> bytes:
     return f"{color} rg BT /F1 {size} Tf {x} {y} Td ({text}) Tj ET\n".encode()
+
+
+def ruled_table(rows, x0=72, y0=600, col_w=110, row_h=18) -> bytes:
+    """Content stream: a ruled grid with the text of *rows* in its cells."""
+    ncols = max(len(r) for r in rows)
+    x1, y1 = x0 + col_w * ncols, y0 - row_h * len(rows)
+    out = [b"0 0 0 RG 0.7 w\n"]
+    for i in range(len(rows) + 1):
+        out.append(f"{x0} {y0 - row_h * i} m {x1} {y0 - row_h * i} l S\n".encode())
+    for j in range(ncols + 1):
+        out.append(f"{x0 + col_w * j} {y0} m {x0 + col_w * j} {y1} l S\n".encode())
+    for i, row in enumerate(rows):
+        for j, cell in enumerate(row):
+            out.append(f"0 g BT /F1 9 Tf {x0 + col_w * j + 4} {y0 - row_h * i - 13} Td ({cell}) Tj ET\n".encode())
+    return b"".join(out)
+
+
+def aligned_table(rows, x0=72, y0=640, xs=(0, 230, 330, 430), step=16) -> bytes:
+    """Content stream: a borderless table, columns aligned by position only."""
+    out = []
+    for i, row in enumerate(rows):
+        for j, cell in enumerate(row):
+            if cell:
+                out.append(f"0 g BT /F1 10 Tf {x0 + xs[j]} {y0 - step * i} Td ({cell}) Tj ET\n".encode())
+    return b"".join(out)

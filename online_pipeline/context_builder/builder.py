@@ -45,6 +45,10 @@ class ContextBuilder:
             block = f"{header}\n{text}"
 
             estimated_tokens = len(block.split())
+            if meta.get("block_kind") in ("table", "xbrl_facts"):
+                # Numbers tokenise far worse than words ("391,035" is several tokens),
+                # so a whitespace count would let tables overrun the model's budget.
+                estimated_tokens = max(estimated_tokens, len(block) // 3)
             if token_budget <= 0:
                 break
             if estimated_tokens > token_budget:

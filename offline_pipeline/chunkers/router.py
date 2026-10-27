@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from offline_pipeline.chunkers.block_chunker import BlockChunker
 from offline_pipeline.chunkers.recursive_chunker import RecursiveTextChunker
 from offline_pipeline.chunkers.text_chunker import TextChunker
+from offline_pipeline.tables.blocks import FACTS, TABLE, Block
 
 
 class ChunkingStrategyRouter:
@@ -22,23 +24,41 @@ class ChunkingStrategyRouter:
         self.chunk_overlap = chunk_overlap
 
     def chunk(
-        self, text: str, metadata: dict[str, Any] | None = None
+        self,
+        text: str,
+        metadata: dict[str, Any] | None = None,
+        blocks: list[Block] | None = None,
     ) -> list[dict[str, Any]]:
-        """Chunk text with the selected or automatically inferred strategy."""
-        selected = self.select_strategy(text=text, metadata=metadata)
+        """Chunk a document with the selected or automatically inferred strategy.
+
+        ``blocks`` (from the structure-aware extractors) are only used when the
+        strategy is ``table_aware``, which ``auto`` picks when the document actually
+        contains tables or XBRL facts. Everything else chunks exactly as before.
+        """
+        selected = self.select_strategy(text=text, metadata=metadata, blocks=blocks)
+        if selected == "table_aware":
+            return BlockChunker(self.chunk_size, self.chunk_overlap).chunk(blocks or [], metadata)
         chunker = self._chunker_for(selected)
         chunks = chunker.chunk(text, metadata)
-
         for chunk in chunks:
             chunk.setdefault("metadata", {})["chunking_strategy"] = selected
         return chunks
 
-    def select_strategy(self, text: str, metadata: dict[str, Any] | None = None) -> str:
+    def select_strategy(
+        self,
+        text: str,
+        metadata: dict[str, Any] | None = None,
+        blocks: list[Block] | None = None,
+    ) -> str:
         """Return the concrete strategy name for a document."""
         requested = (self.strategy or "auto").lower()
+        has_structure = bool(blocks) and any(b.kind in (TABLE, FACTS) for b in blocks or [])
+        if requested == "table_aware":
+            return "table_aware" if blocks else "recursive"
         if requested != "auto":
             return requested
-
+        if has_structure:
+            return "table_aware"
         file_type = str((metadata or {}).get("file_type", "")).lower().lstrip(".")
         if file_type in {"md", "markdown", "html", "web"}:
             return "recursive"

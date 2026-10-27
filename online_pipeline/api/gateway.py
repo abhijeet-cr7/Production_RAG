@@ -35,6 +35,8 @@ from offline_pipeline.safety.injection import (
 )
 from offline_pipeline.safety.net import SafeFetcher
 from offline_pipeline.safety.sandbox import safe_extract_file
+from offline_pipeline.safety.upload_guard import ALLOWED_EXTENSIONS
+from offline_pipeline.tables.blocks import HEADING, PARAGRAPH, blocks_from_json
 from online_pipeline.audit.logger import AuditError, get_audit, record
 from online_pipeline.auth.acl import ACLError, DocumentACL, authorize, build_document_acl
 from online_pipeline.auth.deps import require_scope
@@ -77,7 +79,7 @@ logger = logging.getLogger(__name__)
 
 # ── Request / Response models ────────────────────────────────────────────────
 
-_ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
+_ALLOWED_EXTENSIONS = ALLOWED_EXTENSIONS
 
 
 class QueryRequest(BaseModel):
@@ -261,7 +263,14 @@ def _index_document(
     """
     metadata = doc.setdefault("metadata", {})
     findings: list[Finding] = unicode_findings(doc["text"])  # needs the raw text
-    doc["text"] = TextCleaner().clean(doc["text"])
+    cleaner = TextCleaner()
+    doc["text"] = cleaner.clean(doc["text"])
+    # Structure-aware extractors return blocks (prose, tables, XBRL facts). Table
+    # cells are cleaned cell by cell at extraction; prose is cleaned here.
+    blocks = blocks_from_json(doc["blocks"]) if doc.get("blocks") else None
+    for block in blocks or []:
+        if block.kind in (HEADING, PARAGRAPH):
+            block.text = cleaner.clean(block.text)
     findings += scan_for_injection(doc["text"] + "\n" + str(metadata.get("title", "")))
     if any(metadata.get(k) for k in ("hidden_chars_removed", "hidden_elements_removed", "hidden_runs_removed")):
         findings.append(Finding("hidden_content_removed", MEDIUM))
@@ -277,7 +286,7 @@ def _index_document(
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
     )
-    chunks = chunker.chunk(doc["text"], doc["metadata"])
+    chunks = chunker.chunk(doc["text"], doc["metadata"], blocks=blocks)
 
     if not chunks:
         raise HTTPException(status_code=422, detail="Document produced no text chunks.")

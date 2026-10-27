@@ -267,7 +267,7 @@ class TestUploadGuard:
         ("a.docx", b"plain text", "magic_mismatch"),
         ("a.txt", b"abc\x00def", "magic_mismatch"),
         ("a.exe", b"MZ", "unsupported_type"),
-        ("a.html", b"<html>", "unsupported_type"),
+        ("a.csv", b"a,b,c", "unsupported_type"),
         ("a.pdf", b"", "empty_file"),
     ])
     def test_content_must_match_extension(self, tmp_path, name, data, code):
