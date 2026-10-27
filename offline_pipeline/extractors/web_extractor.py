@@ -53,7 +53,8 @@ class WebExtractor:
             "redirect_count": len(fetched.redirects),
             **extra,
         }
-        return {"text": text, "metadata": metadata}
+        # "raw" is the exact bytes received; the gateway stores and then drops it.
+        return {"text": text, "metadata": metadata, "raw": fetched.body}
 
     @staticmethod
     def _from_html(fetched: FetchResult) -> tuple[str, dict[str, Any]]:

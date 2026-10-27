@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import re
 import tempfile
 import uuid
@@ -49,6 +50,19 @@ from online_pipeline.auth.principal import SCOPE_ADMIN, SCOPE_INGEST, SCOPE_QUER
 from online_pipeline.auth.ratelimit import RateLimiter
 from online_pipeline.auth.tokens import validate_auth_config
 from online_pipeline.cache.embedding_cache import EmbeddingCache, embed_text, embed_texts
+from online_pipeline.provenance.rawstore import RawStore
+from online_pipeline.provenance.trust import (
+    Provenance,
+    ProvenanceError,
+    check_expected_hash,
+    normalise_expected_hash,
+    for_remote,
+    for_upload,
+    parse_as_of,
+    public_source,
+    trust_allows,
+    web_result_provenance,
+)
 from online_pipeline.context_builder.builder import ContextBuilder
 from online_pipeline.grading.grader import GradeResult
 from online_pipeline.llm.router import LLMRouter
@@ -89,6 +103,9 @@ class QueryResponse(BaseModel):
     grounded: bool | None = None
     answer_useful: bool | None = None
     generation_attempts: int = 1
+    # Provenance summary of the sources actually used, e.g. {"verified_primary": 2}.
+    trust_summary: dict[str, int] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class IngestFileResult(BaseModel):
@@ -111,6 +128,11 @@ class IngestUrlRequest(BaseModel):
     acl_groups: list[str] = Field(default_factory=list)
     acl_public: bool = False
     classification: int | None = None
+    # Provenance the caller may declare. Trust tier, publisher and origin are
+    # always computed server-side and cannot be supplied.
+    as_of: str | None = None
+    expected_sha256: str | None = None
+    supersedes: str | None = None
 
 
 class IngestApiRequest(BaseModel):
@@ -120,6 +142,9 @@ class IngestApiRequest(BaseModel):
     acl_groups: list[str] = Field(default_factory=list)
     acl_public: bool = False
     classification: int | None = None
+    as_of: str | None = None
+    expected_sha256: str | None = None
+    supersedes: str | None = None
 
 
 class IngestSourceResponse(BaseModel):
@@ -140,6 +165,11 @@ _context_builder: ContextBuilder | None = None
 _vector_db: VectorDBClient | None = None
 _web_search: TavilyWebSearch | None = None
 _policies: TenantPolicyStore | None = None
+_raw_store: RawStore | None = None
+
+
+def _verified_publishers() -> list[str]:
+    return [p.strip() for p in settings.verified_publishers.split(",") if p.strip()]
 
 
 def _policy_for(principal: Principal) -> TenantPolicy:
@@ -151,7 +181,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     global _llm_router, _cache, _retriever, _reranker, _context_builder, _vector_db, _web_search
     global _policies
     validate_auth_config(settings)  # refuse to start on an unsafe auth setup
+    global _raw_store
     _policies = TenantPolicyStore.load(settings.tenant_policies_path)
+    _raw_store = RawStore(settings.raw_store_dir) if settings.raw_store_enabled else None
     # Fail closed at boot if the audit log cannot be written.
     record("service.start", actor="system", auth_mode=settings.auth_mode, app_env=settings.app_env)
     configure_tracing()
@@ -217,7 +249,9 @@ class IndexResult(NamedTuple):
 
 
 @traced(name="index_document", run_type="chain")
-def _index_document(doc: dict, principal: Principal, acl: DocumentACL) -> IndexResult:
+def _index_document(
+    doc: dict, principal: Principal, acl: DocumentACL, provenance: Provenance
+) -> IndexResult:
     """Screen, clean, enrich, chunk, embed and upsert *doc*.
 
     Every chunk is stamped with *acl*; tenant and owner come from the token, so
@@ -250,7 +284,12 @@ def _index_document(doc: dict, principal: Principal, acl: DocumentACL) -> IndexR
 
     # One batched embed call for the whole document, and one upsert: embedding
     # per chunk dominated ingest time, and a round trip per chunk followed it.
-    stamp = {**acl.as_payload(), "quarantined": quarantined, "screen_flags": list(rules)}
+    stamp = {
+        **acl.as_payload(),
+        **provenance.as_payload(),
+        "quarantined": quarantined,
+        "screen_flags": list(rules),
+    }
     for chunk in chunks:
         # Authoritative stamp: overrides anything an extractor or chunker set.
         chunk["metadata"].update(stamp)
@@ -314,6 +353,7 @@ def _audit_ingest(
     chunks: int = 0,
     reason: str | None = None,
     flags: tuple[str, ...] = (),
+    provenance: Provenance | None = None,
 ) -> None:
     """One audit event per ingested source; origin is fingerprinted, not stored."""
     decision = {"indexed": "allow", "quarantined": "quarantine", "rejected": "reject"}.get(status, "error")
@@ -328,6 +368,8 @@ def _audit_ingest(
         status=status,
         chunks=chunks,
         screen_flags=list(flags),
+        content_sha256=provenance.content_sha256 if provenance else None,
+        trust_tier=provenance.trust_tier if provenance else None,
     )
 
 
@@ -423,9 +465,13 @@ def _display_name(filename: str) -> str:
     return name[: 200 - len(suffix)] + suffix
 
 
-async def _save_upload(file: UploadFile, suffix: str) -> str:
-    """Stream *file* to a temp path, refusing anything over the size cap."""
+async def _save_upload(file: UploadFile, suffix: str) -> tuple[str, str]:
+    """Stream *file* to a temp path, refusing anything over the size cap.
+
+    Returns (path, sha256 of the exact bytes received).
+    """
     total = 0
+    digest = hashlib.sha256()
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         path = tmp.name
         try:
@@ -433,12 +479,67 @@ async def _save_upload(file: UploadFile, suffix: str) -> str:
                 total += len(chunk)
                 if total > settings.ingest_max_upload_bytes:
                     raise UnsafeContent("file_too_large", "File exceeds the upload size limit.")
+                digest.update(chunk)
                 tmp.write(chunk)
         except BaseException:
             tmp.close()
             Path(path).unlink(missing_ok=True)
             raise
-    return path
+    return path, digest.hexdigest()
+
+
+async def _resolve_provenance_inputs(
+    principal: Principal,
+    *,
+    as_of: str | None,
+    expected_sha256: str | None,
+    supersedes: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Validate what the caller may declare about a document's provenance."""
+    try:
+        as_of_value = parse_as_of(as_of)
+        expected = normalise_expected_hash(expected_sha256)
+    except ProvenanceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    target = (supersedes or "").strip() or None
+    if target:
+        info = await run_in_threadpool(_vector_db.get_document_info, principal.tenant_id, target)
+        if info is None:
+            raise HTTPException(status_code=404, detail="supersedes: no such document.")
+        if info.get("owner_id") != principal.user_id and not principal.has_scope(SCOPE_ADMIN):
+            record(
+                "policy.deny", actor=principal, decision="deny",
+                reason="supersedes_not_permitted", resource={"doc_id": target},
+            )
+            raise HTTPException(status_code=403, detail="You can only supersede your own documents.")
+    return as_of_value, expected, target
+
+
+async def _finish_supersession(
+    principal: Principal, old_doc_id: str | None, indexed: "IndexResult"
+) -> None:
+    """Hide the replaced version once its successor is live (never for quarantined ones)."""
+    if not old_doc_id or indexed.quarantined or indexed.doc_id == old_doc_id:
+        return
+    changed = await run_in_threadpool(
+        _vector_db.set_document_payload, principal.tenant_id, old_doc_id,
+        {"superseded": True, "superseded_by": indexed.doc_id},
+    )
+    record(
+        "doc.superseded", actor=principal, resource={"doc_id": old_doc_id},
+        superseded_by=indexed.doc_id, chunks=changed,
+    )
+
+
+def _store_raw_file(tenant_id: str, path: str, sha256: str) -> None:
+    if _raw_store is not None:
+        _raw_store.put_file(tenant_id, path, sha256)
+
+
+def _store_raw_bytes(tenant_id: str, data: bytes, sha256: str) -> None:
+    if _raw_store is not None:
+        _raw_store.put_bytes(tenant_id, data, sha256)
 
 
 @app.post("/ingest", response_model=IngestResponse)
@@ -447,6 +548,9 @@ async def ingest(
     acl_groups: list[str] = Form(default=[]),
     acl_public: bool = Form(default=False),
     classification: int | None = Form(default=None),
+    as_of: str | None = Form(default=None),
+    expected_sha256: str | None = Form(default=None),
+    supersedes: str | None = Form(default=None),
     principal: Principal = Depends(require_scope(SCOPE_INGEST)),
 ) -> IngestResponse:
     """Upload and index one or more documents (PDF, DOCX, or TXT).
@@ -458,6 +562,9 @@ async def ingest(
     """
     acl = _resolve_acl(
         principal, acl_groups=acl_groups, acl_public=acl_public, classification=classification
+    )
+    as_of_value, expected, supersedes_id = await _resolve_provenance_inputs(
+        principal, as_of=as_of, expected_sha256=expected_sha256, supersedes=supersedes
     )
     results: list[IngestFileResult] = []
 
@@ -474,15 +581,24 @@ async def ingest(
             continue
 
         tmp_path: str | None = None
+        provenance: Provenance | None = None
         try:
-            tmp_path = await _save_upload(file, suffix)
+            tmp_path, sha256 = await _save_upload(file, suffix)
+            if not check_expected_hash(expected, sha256):
+                raise UnsafeContent("hash_mismatch", "File does not match the expected SHA-256.")
             doc = await run_in_threadpool(_extract_upload, tmp_path, suffix)
             # The extractor knows nothing about the user's file name, and must
             # never leave a server temp path as the "source" shown to users.
             doc["metadata"]["source"] = filename
             doc["metadata"]["file_type"] = suffix.lstrip(".")
 
-            indexed = await run_in_threadpool(_index_document, doc, principal, acl)
+            provenance = for_upload(
+                filename=filename, content_sha256=sha256, user_id=principal.user_id,
+                as_of=as_of_value, integrity_verified=expected is not None, supersedes=supersedes_id,
+            )
+            await run_in_threadpool(_store_raw_file, principal.tenant_id, tmp_path, sha256)
+            indexed = await run_in_threadpool(_index_document, doc, principal, acl, provenance)
+            await _finish_supersession(principal, supersedes_id, indexed)
             status = "quarantined" if indexed.quarantined else "indexed"
             results.append(IngestFileResult(
                 filename=filename,
@@ -493,7 +609,7 @@ async def ingest(
                         if indexed.quarantined else ""),
             ))
             _audit_ingest(principal, "file", filename, status, doc_id=indexed.doc_id,
-                          chunks=indexed.chunks, flags=indexed.rules)
+                          chunks=indexed.chunks, flags=indexed.rules, provenance=provenance)
         except UnsafeContent as exc:
             results.append(IngestFileResult(
                 filename=filename, status="rejected",
@@ -539,9 +655,16 @@ async def _ingest_remote(
         acl_public=request.acl_public,
         classification=request.classification,
     )
+    as_of_value, expected, supersedes_id = await _resolve_provenance_inputs(
+        principal, as_of=request.as_of, expected_sha256=request.expected_sha256,
+        supersedes=request.supersedes,
+    )
 
     try:
         doc = await run_in_threadpool(fetch)
+        meta = doc["metadata"]
+        if not check_expected_hash(expected, meta["content_sha256"]):
+            raise UnsafeContent("hash_mismatch", "Fetched content does not match the expected SHA-256.")
     except UnsafeContent as exc:
         _audit_ingest(principal, source_type, request.url, "rejected", reason=exc.code)
         if exc.code in _POLICY_REJECTIONS or exc.code.startswith("url_"):
@@ -554,10 +677,20 @@ async def _ingest_remote(
             detail=f"Rejected by security checks ({exc.code}): {exc.detail}",
         ) from exc
 
-    indexed = await run_in_threadpool(_index_document, doc, principal, acl)
+    raw = doc.pop("raw", None)
+    provenance = for_remote(
+        source_type=source_type, final_url=meta["final_url"], content_sha256=meta["content_sha256"],
+        fetched_at=meta["fetched_at"], user_id=principal.user_id,
+        verified_publishers=_verified_publishers(), as_of=as_of_value,
+        integrity_verified=expected is not None, supersedes=supersedes_id,
+    )
+    if raw is not None:
+        await run_in_threadpool(_store_raw_bytes, principal.tenant_id, raw, meta["content_sha256"])
+    indexed = await run_in_threadpool(_index_document, doc, principal, acl, provenance)
+    await _finish_supersession(principal, supersedes_id, indexed)
     status = "quarantined" if indexed.quarantined else "indexed"
     _audit_ingest(principal, source_type, request.url, status, doc_id=indexed.doc_id,
-                  chunks=indexed.chunks, flags=indexed.rules)
+                  chunks=indexed.chunks, flags=indexed.rules, provenance=provenance)
     await run_in_threadpool(_refresh_lexical_index)
     return IngestSourceResponse(
         source=request.url, chunks_indexed=indexed.chunks, doc_id=indexed.doc_id,
@@ -653,8 +786,8 @@ def _stage_retrieve(
 
 
 @traced(name="tavily_web_search", run_type="tool")
-def _stage_web_search(query: str) -> list[dict]:
-    return _web_search.search(query)
+def _stage_web_search(query: str, include_domains: list[str] | None = None) -> list[dict]:
+    return _web_search.search(query, include_domains=include_domains)
 
 
 @traced(name="rerank", run_type="chain")
@@ -722,7 +855,7 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
 
     rewritten = _stage_rewrite(request.query)
     embedding = _stage_embed(rewritten)
-    guard = _AclGuard(principal)
+    guard = _AclGuard(principal, policy)
     candidates = guard.filter(_stage_retrieve(rewritten, embedding, principal, request.source_in))
     reranked = guard.filter(_stage_rerank(rewritten, candidates, request.top_k))
 
@@ -741,7 +874,7 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
     web_search_used = False
     if _local_recall_is_weak(candidates, reranked):
         if allow_web:
-            topped_up = _web_top_up(rewritten, candidates, request.top_k, principal)
+            topped_up = _web_top_up(rewritten, candidates, request.top_k, principal, policy)
             if topped_up is not None:
                 reranked, web_search_used = guard.filter(topped_up), True
         elif deny_reason in POLICY_DENIALS:
@@ -771,7 +904,7 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
         # the problem, so fetch fresh evidence and make one last attempt.
         if grade is not None and not grade.acceptable and not web_search_used:
             if allow_web:
-                topped_up = _web_top_up(rewritten, candidates, request.top_k, principal)
+                topped_up = _web_top_up(rewritten, candidates, request.top_k, principal, policy)
                 if topped_up is not None:
                     reranked, web_search_used = guard.filter(topped_up), True
                     context = _stage_build_context(reranked)
@@ -807,10 +940,20 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
             resource="web_search",
         )
 
-    sources = [r.get("metadata", {}) for r in reranked]
+    metadata_used = [r.get("metadata", {}) for r in reranked]
+    sources = [public_source(m) for m in metadata_used]  # never expose ACL internals
+    trust_summary: dict[str, int] = {}
+    for m in metadata_used:
+        tier = m.get("trust_tier", "unverified")
+        trust_summary[tier] = trust_summary.get(tier, 0) + 1
+    warnings: list[str] = []
+    if trust_summary.get("unverified"):
+        warnings.append("unverified_sources_used")
     response = QueryResponse(
         answer=answer,
         sources=sources,
+        trust_summary=trust_summary,
+        warnings=warnings,
         web_search_used=web_search_used,
         grounded=None if grade is None else grade.grounded,
         answer_useful=None if grade is None else grade.answers_question,
@@ -820,6 +963,8 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
         "returned_doc_ids": [m["doc_id"] for m in sources if m.get("doc_id")][:50],
         "n_sources": len(sources),
         "guard_dropped": guard.dropped,
+        "unverified_dropped": guard.unverified_dropped,
+        "trust_summary": trust_summary,
         "web_used": web_search_used,
         "web_denied": web_denied,
         "grounded": response.grounded,
@@ -831,48 +976,65 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
 
 
 def _web_top_up(
-    query: str, candidates: list[dict], top_k: int, principal: Principal
+    query: str,
+    candidates: list[dict],
+    top_k: int,
+    principal: Principal,
+    policy: TenantPolicy,
 ) -> list[dict] | None:
     """Rerank local candidates together with web hits; None when the web gave nothing."""
-    web_results = _stage_web_search(query)
+    # A tenant that only accepts verified sources may only search verified publishers.
+    domains = _verified_publishers() if policy.require_verified_sources else None
+    web_results = _stage_web_search(query, domains)
     if not web_results:
         return None
-    return _stage_rerank(query, candidates + _stamp_web_acl(web_results, principal), top_k)
+    stamped = _stamp_web_chunks(web_results, principal)
+    return _stage_rerank(query, candidates + stamped, top_k)
 
 
-def _stamp_web_acl(results: list[dict], principal: Principal) -> list[dict]:
-    """Give web hits an explicit ACL: public to the caller's own tenant only.
+def _stamp_web_chunks(results: list[dict], principal: Principal) -> list[dict]:
+    """Give web hits an explicit ACL and a computed trust tier.
 
     They are public by construction, but stamping them (rather than exempting
-    them) means the guard runs the same rule over every chunk, whatever its origin.
+    them) means the guard runs the same rules over every chunk, whatever its
+    origin. The tier comes from the host, never from anything the page says.
     """
     for hit in results:
-        hit.setdefault("metadata", {}).update(
+        meta = hit.setdefault("metadata", {})
+        url = str(meta.get("source") or meta.get("origin") or "")
+        meta.update(
             tenant_id=principal.tenant_id,
             owner_id="web",
             acl_groups=[],
             acl_public=True,
             classification=0,
+            **web_result_provenance(url, _verified_publishers()),
         )
     return results
 
 
 class _AclGuard:
-    """Second enforcement layer: drop anything the principal may not read.
+    """Second enforcement layer: drop what the principal may not read or the
+    tenant does not accept.
 
-    The vector store already pre-filters, so a non-zero count here means a
-    filter was bypassed or a new retriever skipped it. That is audited as an
-    anomaly, never silently absorbed.
+    The vector store already pre-filters ACLs, so a non-zero ``dropped`` means a
+    filter was bypassed or a new retriever skipped it; that is audited as an
+    anomaly, never silently absorbed. ``unverified_dropped`` is ordinary policy:
+    the tenant requires verified sources and this chunk is not one.
     """
 
-    def __init__(self, principal: Principal) -> None:
+    def __init__(self, principal: Principal, policy: TenantPolicy) -> None:
         self.principal = principal
+        self.require_verified = policy.require_verified_sources
         self.dropped = 0
+        self.unverified_dropped = 0
 
     def filter(self, chunks: list[dict]) -> list[dict]:
         allowed, dropped = authorize(chunks, self.principal)
         self.dropped += dropped
-        return allowed
+        trusted = [c for c in allowed if trust_allows(c.get("metadata") or {}, self.require_verified)]
+        self.unverified_dropped += len(allowed) - len(trusted)
+        return trusted
 
 
 def _apply_ungrounded_policy(answer: str, policy: TenantPolicy) -> str:

@@ -429,7 +429,7 @@ class TestUrlIngestPolicy:
         api_extractor.return_value.extract.assert_not_called()
 
     def test_allowed_host_is_ingested_and_audited_with_fingerprint_only(self, api):
-        doc = {"text": "t", "metadata": {}}
+        doc = {"text": "t", "metadata": {"content_sha256": "a" * 64, "final_url": "https://www.sec.gov/Archives/x", "fetched_at": "2024-01-01T00:00:00+00:00"}}
         with patch.object(api.gateway, "WebExtractor") as extractor, \
              patch.object(api.gateway, "_index_document", return_value=api.gateway.IndexResult("doc1", 3)):
             extractor.return_value.extract.return_value = doc
@@ -467,7 +467,8 @@ class TestQueryEndpoint:
             patch.object(g, "_stage_retrieve", return_value=[
                 {"text": "t", "metadata": {
                     "doc_id": "d1", "tenant_id": tenant, "owner_id": "00u123",
-                    "acl_groups": [], "acl_public": False, "classification": 1}}
+                    "acl_groups": [], "acl_public": False, "classification": 1,
+                    "trust_tier": "internal"}}
             ] * 4),
             patch.object(g, "_stage_rerank", side_effect=lambda q, c, k: c[:k]),
             patch.object(g, "_stage_build_context", return_value="ctx"),

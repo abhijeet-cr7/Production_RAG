@@ -30,6 +30,8 @@ class TenantPolicy:
     require_verified_sources: bool = True
     ungrounded_answer_policy: str = "abstain"
     numeric_mismatch_policy: str = "abstain"
+    refuse_investment_advice: bool = True
+    answer_disclaimer: str = ""
 
 
 RESTRICTIVE = TenantPolicy()
@@ -91,7 +93,7 @@ def _build(base: TenantPolicy, values: dict[str, Any], where: str) -> TenantPoli
         raise PolicyError(f"{where}: unknown keys {sorted(unknown)}")
 
     merged = dict(values)
-    for key in ("allow_web_search", "allow_url_ingest", "require_verified_sources"):
+    for key in ("allow_web_search", "allow_url_ingest", "require_verified_sources", "refuse_investment_advice"):
         if key in merged and not isinstance(merged[key], bool):
             raise PolicyError(f"{where}.{key}: must be true or false")
     if "url_allowlist" in merged:
@@ -103,6 +105,10 @@ def _build(base: TenantPolicy, values: dict[str, Any], where: str) -> TenantPoli
         level = merged["max_classification"]
         if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 3:
             raise PolicyError(f"{where}.max_classification: must be an integer 0-3")
+    if "answer_disclaimer" in merged:
+        text = merged["answer_disclaimer"]
+        if not isinstance(text, str) or len(text) > 500:
+            raise PolicyError(f"{where}.answer_disclaimer: must be text of at most 500 characters")
     for key in ("ungrounded_answer_policy", "numeric_mismatch_policy"):
         if key in merged and merged[key] not in _ANSWER_POLICIES:
             raise PolicyError(f"{where}.{key}: must be one of {sorted(_ANSWER_POLICIES)}")

@@ -218,7 +218,10 @@ class TestIngestStampsAcl:
 
     def test_url_ingest_stamps_acl_too(self, api):
         with patch.object(api.gateway, "WebExtractor") as extractor:
-            extractor.return_value.extract.return_value = {"text": "page " * 80, "metadata": {"source": "u"}}
+            extractor.return_value.extract.return_value = {
+                "text": "page " * 80,
+                "metadata": {"source": "u", "content_sha256": "a" * 64, "final_url": "https://www.sec.gov/Archives/x", "fetched_at": "2024-01-01T00:00:00+00:00"},
+            }
             response = api.client.post(
                 "/ingest/url", headers=bearer(),
                 json={"url": "https://www.sec.gov/x", "acl_groups": ["rates"], "classification": 1},

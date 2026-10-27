@@ -68,6 +68,8 @@ class VectorDBClient:
         "classification": "INTEGER",
         "acl_public": "BOOL",
         "quarantined": "BOOL",
+        "superseded": "BOOL",
+        "content_sha256": "KEYWORD",
     }
 
     def _ensure_payload_indexes(self) -> None:
@@ -211,6 +213,58 @@ class VectorDBClient:
                 points=flt,
             )
         return count
+
+    # ── per-document lifecycle helpers ──────────────────────────────────────
+
+    @staticmethod
+    def _doc_filter(tenant_id: str, doc_id: str) -> Any:
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        return Filter(must=[
+            FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)),
+            FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
+        ])
+
+    def get_document_info(self, tenant_id: str, doc_id: str) -> dict[str, Any] | None:
+        """Payload of one chunk of *doc_id* (owner, ACL, hash, flags), or None if absent."""
+        points, _ = self._client.scroll(
+            collection_name=self.collection_for_tenant(tenant_id),
+            scroll_filter=self._doc_filter(tenant_id, doc_id),
+            limit=1, with_payload=True, with_vectors=False,
+        )
+        return dict(points[0].payload or {}) if points else None
+
+    def set_document_payload(self, tenant_id: str, doc_id: str, payload: dict[str, Any]) -> int:
+        """Merge *payload* into every chunk of *doc_id*; returns the chunk count."""
+        flt = self._doc_filter(tenant_id, doc_id)
+        collection = self.collection_for_tenant(tenant_id)
+        count = self._client.count(collection_name=collection, count_filter=flt, exact=True).count
+        if count:
+            self._client.set_payload(collection_name=collection, payload=payload, points=flt)
+        return count
+
+    def delete_document(self, tenant_id: str, doc_id: str) -> int:
+        """Delete every chunk of *doc_id*; returns how many were removed."""
+        from qdrant_client.models import FilterSelector
+
+        flt = self._doc_filter(tenant_id, doc_id)
+        collection = self.collection_for_tenant(tenant_id)
+        count = self._client.count(collection_name=collection, count_filter=flt, exact=True).count
+        if count:
+            self._client.delete(collection_name=collection, points_selector=FilterSelector(filter=flt))
+        return count
+
+    def count_by_hash(self, tenant_id: str, content_sha256: str) -> int:
+        """How many chunks (any document) of this tenant reference *content_sha256*."""
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        flt = Filter(must=[
+            FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)),
+            FieldCondition(key="content_sha256", match=MatchValue(value=content_sha256)),
+        ])
+        return self._client.count(
+            collection_name=self.collection_for_tenant(tenant_id), count_filter=flt, exact=True
+        ).count
 
     @staticmethod
     def _quarantine_filter(tenant_id: str, doc_id: str | None = None) -> Any:

@@ -138,6 +138,8 @@ def is_authorized(payload: dict[str, Any], principal: Principal) -> bool:
         return False
     if payload.get("quarantined") is True:  # held back by the injection screen
         return False
+    if payload.get("superseded") is True:   # replaced by a newer version
+        return False
 
     level = payload.get("classification")
     if isinstance(level, bool) or not isinstance(level, int) or level > principal.clearance:
@@ -180,5 +182,8 @@ def build_qdrant_filter(principal: Principal, source_in: list[str] | None = None
     ]
     if source_in:
         must.append(FieldCondition(key="source", match=MatchAny(any=list(source_in))))
-    quarantined = FieldCondition(key="quarantined", match=MatchValue(value=True))
-    return Filter(must=must, must_not=[quarantined])
+    hidden = [
+        FieldCondition(key="quarantined", match=MatchValue(value=True)),
+        FieldCondition(key="superseded", match=MatchValue(value=True)),
+    ]
+    return Filter(must=must, must_not=hidden)

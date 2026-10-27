@@ -97,6 +97,15 @@ class Settings(BaseSettings):
     pdf_ocr_max_pages: int = 20
     extracted_text_max_chars: int = 5_000_000
 
+    # ── Provenance ───────────────────────────────────────────────────────────
+    # Publishers whose https content counts as verified_primary. Server-side only.
+    verified_publishers: str = "sec.gov"
+    raw_store_enabled: bool = True
+    raw_store_dir: str = "data/raw"      # content-addressed originals, per tenant
+
+    # ── Answer safety ────────────────────────────────────────────────────────
+    require_citations: bool = True       # figures and answers must cite [n] sources
+
     # ── Authentication (Okta) ────────────────────────────────────────────────
     app_env: str = "dev"              # "dev" | "staging" | "prod"
     # "okta" validates Okta-issued RS256 access tokens; "dev_token" (HS256) and
@@ -125,6 +134,8 @@ class Settings(BaseSettings):
     langsmith_api_key: str = ""       # https://smith.langchain.com
     langsmith_project: str = "production-rag"
     langsmith_endpoint: str = "https://api.smith.langchain.com"
+    # Send only run names, timings and ids to LangSmith, never prompts or answers.
+    langsmith_hide_content: bool = True
 
 
 settings = Settings()

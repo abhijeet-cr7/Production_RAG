@@ -278,7 +278,9 @@ def api(audit_log):
 
     cfg = Settings(_env_file=None, app_env="dev", auth_mode="dev_token",
                    dev_jwt_secret=DEV_SECRET, audit_hmac_key="k")
-    policies = TenantPolicyStore(tenants={"eq": TenantPolicy(allow_web_search=True)})
+    policies = TenantPolicyStore(tenants={
+        "eq": TenantPolicy(allow_web_search=True, require_verified_sources=False),
+    })
     with patch.object(deps, "get_validator", return_value=TokenValidator(cfg)), \
          patch.object(gateway, "_policies", policies):
         yield SimpleNamespace(client=TestClient(gateway.app), gateway=gateway, audit=audit_log)
@@ -295,7 +297,7 @@ def bearer(tenant="eq", scopes=("rag:query", "rag:web"), groups=("fx",), clearan
 
 def chunk(doc_id, tenant="eq", **over):
     meta = {"doc_id": doc_id, "tenant_id": tenant, "owner_id": "alice", "acl_groups": [],
-            "acl_public": False, "classification": 1, "source": "s"}
+            "acl_public": False, "classification": 1, "source": "s", "trust_tier": "internal"}
     meta.update(over)
     return {"text": f"text of {doc_id}", "metadata": meta}
 
@@ -368,9 +370,12 @@ class TestGatewayGuard:
         web = [{"text": "from the web", "metadata": {"source": "https://example.com", "origin": "tavily"}}]
         response, build_context = self.run(api, [chunk("a")], web=web, weak=True)
         assert response.json()["web_search_used"] is True
-        web_chunk = next(c for c in build_context.call_args.args[0] if c["metadata"].get("origin") == "tavily")
+        web_chunk = next(c for c in build_context.call_args.args[0]
+                         if c["metadata"].get("source_type") == "web_search")
         meta = web_chunk["metadata"]
         assert (meta["tenant_id"], meta["acl_public"], meta["classification"]) == ("eq", True, 0)
+        # Trust comes from the host, never from anything the page claims.
+        assert (meta["trust_tier"], meta["publisher"]) == ("unverified", "example.com")
 
     def test_client_supplied_metadata_filter_is_rejected(self, api):
         response = api.client.post("/query", headers=bearer(),

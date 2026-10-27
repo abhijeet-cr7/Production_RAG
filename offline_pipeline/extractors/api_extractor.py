@@ -63,4 +63,5 @@ class APIExtractor:
                 "fetched_at": fetched.fetched_at,
                 "redirect_count": len(fetched.redirects),
             },
+            "raw": fetched.body,
         }

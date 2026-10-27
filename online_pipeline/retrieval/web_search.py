@@ -33,16 +33,27 @@ class TavilyWebSearch:
         """True when a Tavily client was successfully constructed."""
         return self._client is not None
 
-    def search(self, query: str, max_results: int | None = None) -> list[dict[str, Any]]:
-        """Return web results for *query*, or an empty list on any failure."""
+    def search(
+        self,
+        query: str,
+        max_results: int | None = None,
+        include_domains: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return web results for *query*, or an empty list on any failure.
+
+        ``include_domains`` restricts results to those publishers (used when a
+        tenant only accepts verified sources).
+        """
         if self._client is None or not query.strip():
             return []
 
+        extra: dict[str, Any] = {"include_domains": include_domains} if include_domains else {}
         try:
             response = self._client.search(
                 query=query,
                 max_results=max_results or self.max_results,
                 search_depth=self.search_depth,
+                **extra,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Tavily search failed: %s", exc)
