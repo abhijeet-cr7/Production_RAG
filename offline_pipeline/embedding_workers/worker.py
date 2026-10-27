@@ -53,6 +53,16 @@ class EmbeddingWorker:
                 self._process_batch(batch)
 
     def _process_batch(self, batch: list[dict[str, Any]]) -> None:
+        # Default deny at write: a chunk without ACL fields would be unreadable
+        # by everyone at best and unfiltered at worst, so it never gets indexed.
+        from online_pipeline.auth.acl import has_acl
+
+        stamped = [c for c in batch if has_acl(c.get("metadata") or {})]
+        if len(stamped) != len(batch):
+            logger.error("Skipping %d chunk(s) without ACL metadata.", len(batch) - len(stamped))
+        batch = stamped
+        if not batch:
+            return
         texts = [c["text"] for c in batch]
         try:
             vectors = self.embedder.embed(texts)

@@ -11,7 +11,7 @@ from typing import AsyncIterator
 
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -24,6 +24,7 @@ from offline_pipeline.extractors.web_extractor import WebExtractor
 from offline_pipeline.preprocessors.cleaner import TextCleaner
 from offline_pipeline.preprocessors.metadata_enricher import MetadataEnricher
 from online_pipeline.audit.logger import AuditError, get_audit, record
+from online_pipeline.auth.acl import ACLError, DocumentACL, build_document_acl
 from online_pipeline.auth.deps import require_scope
 from online_pipeline.auth.policy import (
     POLICY_DENIALS,
@@ -87,12 +88,18 @@ class IngestResponse(BaseModel):
 
 class IngestUrlRequest(BaseModel):
     url: str
+    acl_groups: list[str] = Field(default_factory=list)
+    acl_public: bool = False
+    classification: int | None = None
 
 
 class IngestApiRequest(BaseModel):
     url: str
     params: dict | None = None
     text_fields: list[str] | None = None
+    acl_groups: list[str] = Field(default_factory=list)
+    acl_public: bool = False
+    classification: int | None = None
 
 
 class IngestSourceResponse(BaseModel):
@@ -181,10 +188,16 @@ async def health() -> dict:
 
 
 @traced(name="index_document", run_type="chain")
-def _index_document(doc: dict) -> tuple[str, int]:
-    """Clean, enrich, chunk, embed and upsert *doc*. Returns (doc_id, chunk count)."""
+def _index_document(doc: dict, principal: Principal, acl: DocumentACL) -> tuple[str, int]:
+    """Clean, enrich, chunk, embed and upsert *doc*. Returns (doc_id, chunk count).
+
+    Every chunk is stamped with *acl*; tenant and owner come from the token, so
+    nothing in the request can change who owns a document.
+    """
     doc["text"] = TextCleaner().clean(doc["text"])
-    doc = MetadataEnricher().enrich(doc)
+    doc = MetadataEnricher().enrich(
+        doc, tenant_id=principal.tenant_id, owner_id=principal.user_id
+    )
 
     chunker = ChunkingStrategyRouter(
         strategy=settings.chunking_strategy,
@@ -198,6 +211,11 @@ def _index_document(doc: dict) -> tuple[str, int]:
 
     # One batched embed call for the whole document, and one upsert: embedding
     # per chunk dominated ingest time, and a round trip per chunk followed it.
+    acl_payload = acl.as_payload()
+    for chunk in chunks:
+        # Authoritative stamp: overrides anything an extractor or chunker set.
+        chunk["metadata"].update(acl_payload)
+
     vectors = embed_texts([chunk["text"] for chunk in chunks])
 
     points = []
@@ -217,6 +235,34 @@ def _index_document(doc: dict) -> tuple[str, int]:
     _vector_db.upsert(points)
 
     return doc["metadata"]["doc_id"], len(chunks)
+
+
+def _resolve_acl(
+    principal: Principal,
+    *,
+    acl_groups: list[str] | None,
+    acl_public: bool,
+    classification: int | None,
+) -> DocumentACL:
+    """Validate the requested ACL up front so a bad one rejects the whole request."""
+    try:
+        return build_document_acl(
+            principal,
+            _policy_for(principal),
+            acl_groups=acl_groups,
+            acl_public=acl_public,
+            classification=classification,
+        )
+    except ACLError as exc:
+        record(
+            "policy.deny",
+            actor=principal,
+            decision="deny",
+            reason="acl_not_permitted",
+            resource="document_acl",
+            code=exc.code,
+        )
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 def _audit_ingest(
@@ -267,6 +313,9 @@ def _require_url_ingest(principal: Principal, url: str, source_type: str) -> Non
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest(
     files: list[UploadFile] = File(...),
+    acl_groups: list[str] = Form(default=[]),
+    acl_public: bool = Form(default=False),
+    classification: int | None = Form(default=None),
     principal: Principal = Depends(require_scope(SCOPE_INGEST)),
 ) -> IngestResponse:
     """Upload and index one or more documents (PDF, DOCX, or TXT).
@@ -275,6 +324,9 @@ async def ingest(
     extract → clean → enrich → chunk → embed → upsert.
     Files are processed independently; a failure in one does not abort the rest.
     """
+    acl = _resolve_acl(
+        principal, acl_groups=acl_groups, acl_public=acl_public, classification=classification
+    )
     results: list[IngestFileResult] = []
 
     for file in files:
@@ -298,7 +350,7 @@ async def ingest(
             doc["metadata"].setdefault("source", filename)
             doc["metadata"].setdefault("file_type", suffix.lstrip("."))
 
-            doc_id, chunk_count = _index_document(doc)
+            doc_id, chunk_count = _index_document(doc, principal, acl)
             results.append(IngestFileResult(
                 filename=filename,
                 status="indexed",
@@ -336,6 +388,12 @@ async def ingest_url(
     if not request.url.strip().lower().startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
     _require_url_ingest(principal, request.url, "url")
+    acl = _resolve_acl(
+        principal,
+        acl_groups=request.acl_groups,
+        acl_public=request.acl_public,
+        classification=request.classification,
+    )
 
     try:
         doc = WebExtractor().extract(request.url.strip())
@@ -343,7 +401,7 @@ async def ingest_url(
         _audit_ingest(principal, "url", request.url, "error", reason=type(exc).__name__)
         raise HTTPException(status_code=422, detail=f"Failed to fetch URL: {exc}") from exc
 
-    doc_id, chunk_count = _index_document(doc)
+    doc_id, chunk_count = _index_document(doc, principal, acl)
     _audit_ingest(principal, "url", request.url, "indexed", doc_id=doc_id, chunks=chunk_count)
     _refresh_lexical_index()
     return IngestSourceResponse(source=request.url, chunks_indexed=chunk_count, doc_id=doc_id)
@@ -358,6 +416,12 @@ async def ingest_api(
     if not request.url.strip().lower().startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
     _require_url_ingest(principal, request.url, "api")
+    acl = _resolve_acl(
+        principal,
+        acl_groups=request.acl_groups,
+        acl_public=request.acl_public,
+        classification=request.classification,
+    )
 
     try:
         doc = APIExtractor().extract(
@@ -369,7 +433,7 @@ async def ingest_api(
         _audit_ingest(principal, "api", request.url, "error", reason=type(exc).__name__)
         raise HTTPException(status_code=422, detail=f"Failed to fetch API: {exc}") from exc
 
-    doc_id, chunk_count = _index_document(doc)
+    doc_id, chunk_count = _index_document(doc, principal, acl)
     _audit_ingest(principal, "api", request.url, "indexed", doc_id=doc_id, chunks=chunk_count)
     _refresh_lexical_index()
     return IngestSourceResponse(source=request.url, chunks_indexed=chunk_count, doc_id=doc_id)

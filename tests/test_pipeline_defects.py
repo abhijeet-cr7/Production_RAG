@@ -117,10 +117,24 @@ class TestWorkerPointIdentity:
 
     @staticmethod
     def _chunks(count: int) -> list[dict]:
+        acl = {
+            "tenant_id": "t1", "owner_id": "u1", "acl_groups": [],
+            "acl_public": False, "classification": 1,
+        }
         return [
-            {"text": f"chunk {i}", "metadata": {"doc_id": "FILING_A", "chunk_index": i}}
+            {"text": f"chunk {i}", "metadata": {"doc_id": "FILING_A", "chunk_index": i, **acl}}
             for i in range(count)
         ]
+
+    def test_chunks_without_acl_metadata_are_never_indexed(self):
+        chunks = self._chunks(4)
+        del chunks[1]["metadata"]["tenant_id"]
+        del chunks[2]["metadata"]["classification"]
+        worker, vector_db = self._worker(chunks, batch_size=32)
+        worker.run()
+
+        upserted = [p for call in vector_db.upsert.call_args_list for p in call.args[0]]
+        assert [p["text"] for p in upserted] == ["chunk 0", "chunk 3"]
 
     def test_every_chunk_gets_a_distinct_point_id(self):
         worker, vector_db = self._worker(self._chunks(64), batch_size=32)

@@ -53,6 +53,41 @@ class VectorDBClient:
                 ),
             )
             logger.info("Created Qdrant collection '%s'.", self.collection)
+        self._ensure_payload_indexes()
+
+    # Fields every entitlement filter touches. Indexing them keeps filtered
+    # search fast and is idempotent, so it also upgrades existing collections.
+    _PAYLOAD_INDEXES = {
+        "tenant_id": "KEYWORD",
+        "owner_id": "KEYWORD",
+        "acl_groups": "KEYWORD",
+        "doc_id": "KEYWORD",
+        "source": "KEYWORD",
+        "classification": "INTEGER",
+        "acl_public": "BOOL",
+    }
+
+    def _ensure_payload_indexes(self) -> None:
+        from qdrant_client.models import PayloadSchemaType
+
+        for field, schema in self._PAYLOAD_INDEXES.items():
+            try:
+                self._client.create_payload_index(
+                    collection_name=self.collection,
+                    field_name=field,
+                    field_schema=getattr(PayloadSchemaType, schema),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not create payload index '%s': %s", field, exc)
+
+    def collection_for_tenant(self, tenant_id: str) -> str:
+        """Collection that holds *tenant_id*'s data.
+
+        One shared collection today, isolated by the ``tenant_id`` payload
+        filter. Returning a per-tenant name here (and provisioning it) is the
+        single change needed to move to collection-per-tenant isolation.
+        """
+        return self.collection
 
     def upsert(self, points: list[dict[str, Any]]) -> None:
         """Upsert *points* into the collection.
@@ -152,6 +187,8 @@ class VectorDBClient:
         try:
             from qdrant_client import QdrantClient
 
+            if self.url == ":memory:":  # in-process engine, used by tests
+                return QdrantClient(":memory:")
             return QdrantClient(
                 url=self.url,
                 api_key=self.api_key,
