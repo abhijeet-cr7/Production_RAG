@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
@@ -11,6 +12,7 @@ from typing import AsyncIterator
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -33,7 +35,7 @@ from online_pipeline.auth.policy import (
 )
 from online_pipeline.auth.principal import SCOPE_INGEST, SCOPE_QUERY, Principal
 from online_pipeline.auth.tokens import validate_auth_config
-from online_pipeline.cache.embedding_cache import EmbeddingCache, embed_text
+from online_pipeline.cache.embedding_cache import EmbeddingCache, embed_text, embed_texts
 from online_pipeline.context_builder.builder import ContextBuilder
 from online_pipeline.grading.grader import GradeResult
 from online_pipeline.llm.router import LLMRouter
@@ -42,6 +44,8 @@ from online_pipeline.reranker.reranker import Reranker
 from online_pipeline.retrieval.hybrid_retriever import HybridRetriever
 from online_pipeline.retrieval.web_search import TavilyWebSearch
 from vector_db.client import VectorDBClient
+
+logger = logging.getLogger(__name__)
 
 
 # ── Request / Response models ────────────────────────────────────────────────
@@ -126,7 +130,12 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     _vector_db.ensure_collection()
     _llm_router = LLMRouter()
     _cache = EmbeddingCache(redis_url=settings.redis_url)
-    _retriever = HybridRetriever(vector_db=_vector_db)
+    _retriever = HybridRetriever(
+        vector_db=_vector_db,
+        bm25_weight=settings.bm25_weight,
+        vector_weight=settings.vector_weight,
+    )
+    _refresh_lexical_index()
     _reranker = Reranker()
     _context_builder = ContextBuilder()
     _web_search = TavilyWebSearch()
@@ -147,9 +156,28 @@ async def _audit_unavailable(_: Request, exc: AuditError) -> JSONResponse:
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 
+def _refresh_lexical_index() -> None:
+    """Rebuild the BM25 index from the chunks currently in the vector store.
+
+    The retriever is constructed without a corpus, so without this call the
+    lexical branch never runs and "hybrid" retrieval is dense-only.
+    """
+    if not settings.bm25_enabled or _retriever is None or _vector_db is None:
+        return
+    try:
+        corpus = _vector_db.scroll_all(limit=settings.bm25_max_corpus_chunks)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read corpus for BM25 (%s); retrieval is dense-only.", exc)
+        return
+    _retriever.load_corpus(corpus)
+
+
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "lexical_retrieval": bool(_retriever and _retriever.lexical_enabled),
+    }
 
 
 @traced(name="index_document", run_type="chain")
@@ -168,20 +196,25 @@ def _index_document(doc: dict) -> tuple[str, int]:
     if not chunks:
         raise HTTPException(status_code=422, detail="Document produced no text chunks.")
 
-    for chunk in chunks:
-        vector = embed_text(chunk["text"])
+    # One batched embed call for the whole document, and one upsert: embedding
+    # per chunk dominated ingest time, and a round trip per chunk followed it.
+    vectors = embed_texts([chunk["text"] for chunk in chunks])
+
+    points = []
+    for chunk, vector in zip(chunks, vectors):
         # Qdrant requires IDs to be unsigned ints or UUIDs.
         # Derive a stable UUID5 from the doc_id + chunk_index.
         point_id = str(uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"{doc['metadata']['doc_id']}_{chunk['metadata']['chunk_index']}",
         ))
-        _vector_db.upsert([{
+        points.append({
             "id": point_id,
             "vector": vector,
             "payload": chunk["metadata"],
             "text": chunk["text"],
-        }])
+        })
+    _vector_db.upsert(points)
 
     return doc["metadata"]["doc_id"], len(chunks)
 
@@ -285,6 +318,9 @@ async def ingest(
     if all(r.status == "error" for r in results):
         raise HTTPException(status_code=400, detail="; ".join(f"{r.filename}: {r.detail}" for r in results))
 
+    # New chunks are invisible to the lexical branch until the index is rebuilt.
+    _refresh_lexical_index()
+
     return IngestResponse(
         files=results,
         total_chunks_indexed=sum(r.chunks_indexed for r in results),
@@ -309,6 +345,7 @@ async def ingest_url(
 
     doc_id, chunk_count = _index_document(doc)
     _audit_ingest(principal, "url", request.url, "indexed", doc_id=doc_id, chunks=chunk_count)
+    _refresh_lexical_index()
     return IngestSourceResponse(source=request.url, chunks_indexed=chunk_count, doc_id=doc_id)
 
 
@@ -334,6 +371,7 @@ async def ingest_api(
 
     doc_id, chunk_count = _index_document(doc)
     _audit_ingest(principal, "api", request.url, "indexed", doc_id=doc_id, chunks=chunk_count)
+    _refresh_lexical_index()
     return IngestSourceResponse(source=request.url, chunks_indexed=chunk_count, doc_id=doc_id)
 
 
@@ -413,7 +451,9 @@ async def query(
     request_id = uuid.uuid4().hex
     query_fp = get_audit().fingerprint(request.query)
     try:
-        response, audit_details = _answer_query(request, principal)
+        # The pipeline is synchronous and network/CPU bound; run it off the event
+        # loop so concurrent queries overlap instead of queueing behind one another.
+        response, audit_details = await run_in_threadpool(_answer_query, request, principal)
     except Exception as exc:  # noqa: BLE001
         record(
             "query",

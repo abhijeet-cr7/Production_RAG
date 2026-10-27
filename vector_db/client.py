@@ -117,6 +117,35 @@ class VectorDBClient:
             )
         return results
 
+    def scroll_all(self, limit: int = 50_000, page_size: int = 256) -> list[dict[str, Any]]:
+        """Read up to *limit* stored chunks back out of the collection.
+
+        BM25 needs the lexical corpus in memory, and the vector store is the
+        only place the chunk text lives. Paged so a large collection does not
+        arrive in one response.
+
+        Returns:
+            List of dicts with keys ``text`` and ``metadata``.
+        """
+        records: list[dict[str, Any]] = []
+        offset: Any = None
+        while len(records) < limit:
+            batch, offset = self._client.scroll(
+                collection_name=self.collection,
+                limit=min(page_size, limit - len(records)),
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in batch:
+                payload = dict(point.payload or {})
+                text = payload.pop("text", "")
+                if text:
+                    records.append({"text": text, "metadata": payload})
+            if offset is None or not batch:
+                break
+        return records
+
     # ── private helpers ──────────────────────────────────────────────────────
 
     def _connect(self) -> Any:

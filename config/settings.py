@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     bm25_weight: float = 0.3
     vector_weight: float = 0.7
 
+    # BM25 lexical branch. The index is in-memory and rebuilt from the vector
+    # store, so cap how much of the corpus it will pull in.
+    bm25_enabled: bool = True
+    bm25_max_corpus_chunks: int = 50_000
+
     # ── Chunking ─────────────────────────────────────────────────────────────
     chunking_strategy: str = "auto"  # "auto" | "fixed_token" | "recursive"
     chunk_size: int = 512
