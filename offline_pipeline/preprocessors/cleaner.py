@@ -12,6 +12,7 @@ class TextCleaner:
     def clean(self, text: str) -> str:
         """Return a cleaned version of *text*."""
         text = self._normalise_unicode(text)
+        text = self._strip_invisible(text)
         text = self._remove_control_chars(text)
         text = self._collapse_whitespace(text)
         return text.strip()
@@ -20,6 +21,13 @@ class TextCleaner:
 
     def _normalise_unicode(self, text: str) -> str:
         return unicodedata.normalize("NFKC", text)
+
+    def _strip_invisible(self, text: str) -> str:
+        # Zero-width, bidi-override and Unicode "tag" characters are invisible to
+        # a reviewer but readable by a model, so they never reach the index.
+        from offline_pipeline.safety.injection import INVISIBLE_CHARS
+
+        return INVISIBLE_CHARS.sub("", text)
 
     def _remove_control_chars(self, text: str) -> str:
         # Keep newlines (\n) and tabs (\t) for structural context

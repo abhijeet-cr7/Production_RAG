@@ -82,6 +82,21 @@ class Settings(BaseSettings):
     # Total generation attempts per request: first draft + stricter regenerations.
     max_generation_attempts: int = 2
 
+    # ── Ingestion safety ─────────────────────────────────────────────────────
+    ingest_max_upload_bytes: int = 25 * 1024 * 1024
+    ingest_max_fetch_bytes: int = 10 * 1024 * 1024
+    ingest_max_redirects: int = 3
+    ingest_fetch_timeout_seconds: float = 30.0
+    ingest_allow_http: bool = False          # dev only; production is https-only
+    ingest_rate_limit_per_minute: int = 20   # URL/API ingests per user, per process
+    # Untrusted files are parsed in a resource-limited subprocess.
+    parser_timeout_seconds: int = 120
+    parser_cpu_seconds: int = 110
+    parser_max_memory_mb: int = 1024
+    pdf_max_pages: int = 500
+    pdf_ocr_max_pages: int = 20
+    extracted_text_max_chars: int = 5_000_000
+
     # ── Authentication (Okta) ────────────────────────────────────────────────
     app_env: str = "dev"              # "dev" | "staging" | "prod"
     # "okta" validates Okta-issued RS256 access tokens; "dev_token" (HS256) and

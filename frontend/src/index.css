@@ -373,3 +373,20 @@ code.truncate {
   font-family: var(--font);
 }
 .history-item:hover { background: var(--bg-hover); color: var(--text); }
+
+
+/* ── Access token bar ─────────────────────────────────────────────────────── */
+.token-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+  margin-right: 1rem;
+  font-size: 0.8rem;
+}
+.token-input { width: 16rem; padding: 0.35rem 0.6rem; }
+.token-state { padding: 0.15rem 0.5rem; border-radius: 999px; background: rgba(255,255,255,0.08); }
+.token-state.ok { color: #6ee7b7; }
+.token-state.bad { color: #fca5a5; }
+.token-scopes { opacity: 0.65; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.btn-small { padding: 0.3rem 0.7rem; font-size: 0.78rem; }

@@ -1,6 +1,11 @@
 import { useState, useRef } from 'react'
+import { authHeaders } from '../auth'
 
 const ALLOWED = ['.pdf', '.docx', '.txt']
+
+// quarantined = stored but hidden until an administrator reviews it;
+// rejected = failed a security check and was not stored.
+const STATUS_ICON = { indexed: '✅', quarantined: '🛡️', rejected: '⛔', error: '⚠️' }
 
 export default function FileUpload() {
   const [dragging, setDragging] = useState(false)
@@ -58,7 +63,7 @@ export default function FileUpload() {
     files.forEach(f => form.append('files', f))
 
     try {
-      const res = await fetch('/ingest', { method: 'POST', body: form })
+      const res = await fetch('/ingest', { method: 'POST', headers: authHeaders(), body: form })
       const data = await res.json()
       if (!res.ok) {
         setStatus('error')
@@ -83,7 +88,7 @@ export default function FileUpload() {
     try {
       const res = await fetch('/ingest/url', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ url: url.trim() }),
       })
       const data = await res.json()
@@ -168,7 +173,7 @@ export default function FileUpload() {
             <tbody>
               {result.files.map(f => (
                 <tr key={f.filename}>
-                  <td>{f.status === 'indexed' ? '✅' : '⚠️'}</td>
+                  <td>{STATUS_ICON[f.status] || '⚠️'}</td>
                   <td>
                     <code>{f.filename}</code>{' '}
                     {f.status === 'indexed'

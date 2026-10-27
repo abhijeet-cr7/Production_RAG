@@ -411,7 +411,7 @@ class TestUrlIngestPolicy:
                 "/ingest/url", json={"url": "https://sec.gov/x"}, headers=bearer(tenant="closed")
             )
         assert response.status_code == 403
-        extractor.assert_not_called()
+        extractor.return_value.extract.assert_not_called()
         event = audit_events(api.audit)[-1]
         assert (event["action"], event["reason"]) == ("policy.deny", "url_not_allowed")
 
@@ -425,13 +425,13 @@ class TestUrlIngestPolicy:
             r1 = api.client.post("/ingest/url", json={"url": url}, headers=bearer())
             r2 = api.client.post("/ingest/api", json={"url": url}, headers=bearer())
         assert (r1.status_code, r2.status_code) == (403, 403)
-        extractor.assert_not_called()
-        api_extractor.assert_not_called()
+        extractor.return_value.extract.assert_not_called()
+        api_extractor.return_value.extract.assert_not_called()
 
     def test_allowed_host_is_ingested_and_audited_with_fingerprint_only(self, api):
         doc = {"text": "t", "metadata": {}}
         with patch.object(api.gateway, "WebExtractor") as extractor, \
-             patch.object(api.gateway, "_index_document", return_value=("doc1", 3)):
+             patch.object(api.gateway, "_index_document", return_value=api.gateway.IndexResult("doc1", 3)):
             extractor.return_value.extract.return_value = doc
             response = api.client.post(
                 "/ingest/url", json={"url": "https://www.sec.gov/Archives/x"}, headers=bearer()
@@ -443,9 +443,9 @@ class TestUrlIngestPolicy:
         assert "sec.gov/Archives" not in api.audit.path.read_text()
 
     def test_file_ingest_audits_each_file_without_filename(self, api):
-        with patch.object(api.gateway, "DocumentExtractor") as extractor, \
-             patch.object(api.gateway, "_index_document", return_value=("d9", 2)):
-            extractor.return_value.extract.return_value = {"text": "t", "metadata": {}}
+        with patch.object(api.gateway, "safe_extract_file") as extractor, \
+             patch.object(api.gateway, "_index_document", return_value=api.gateway.IndexResult("d9", 2)):
+            extractor.return_value = {"text": "t", "metadata": {}}
             response = api.client.post(
                 "/ingest", headers=bearer(),
                 files=[("files", ("secret-deal-memo.txt", b"hello", "text/plain")),

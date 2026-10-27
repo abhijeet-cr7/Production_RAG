@@ -67,6 +67,7 @@ class VectorDBClient:
         "source": "KEYWORD",
         "classification": "INTEGER",
         "acl_public": "BOOL",
+        "quarantined": "BOOL",
     }
 
     def _ensure_payload_indexes(self) -> None:
@@ -165,6 +166,63 @@ class VectorDBClient:
             with_vectors=False,
         )
         return {str(p.id): dict(p.payload or {}) for p in points}
+
+    def list_quarantined(self, tenant_id: str) -> list[dict[str, Any]]:
+        """One summary row per quarantined document of *tenant_id*."""
+        flt = self._quarantine_filter(tenant_id)
+        documents: dict[str, dict[str, Any]] = {}
+        offset: Any = None
+        while True:
+            batch, offset = self._client.scroll(
+                collection_name=self.collection_for_tenant(tenant_id),
+                scroll_filter=flt, limit=256, offset=offset,
+                with_payload=True, with_vectors=False,
+            )
+            for point in batch:
+                payload = point.payload or {}
+                row = documents.setdefault(str(payload.get("doc_id")), {
+                    "doc_id": payload.get("doc_id"),
+                    "source": payload.get("source"),
+                    "owner_id": payload.get("owner_id"),
+                    "rules": payload.get("screen_flags", []),
+                    "ingested_at": payload.get("ingested_at"),
+                    "chunks": 0,
+                })
+                row["chunks"] += 1
+            if offset is None or not batch:
+                break
+        return list(documents.values())
+
+    def release_quarantine(self, tenant_id: str, doc_id: str, released_by: str) -> int:
+        """Un-quarantine every chunk of *doc_id*; returns how many chunks changed."""
+        from datetime import datetime, timezone
+
+        flt = self._quarantine_filter(tenant_id, doc_id)
+        collection = self.collection_for_tenant(tenant_id)
+        count = self._client.count(collection_name=collection, count_filter=flt, exact=True).count
+        if count:
+            self._client.set_payload(
+                collection_name=collection,
+                payload={
+                    "quarantined": False,
+                    "quarantine_released_by": released_by,
+                    "quarantine_released_at": datetime.now(tz=timezone.utc).isoformat(),
+                },
+                points=flt,
+            )
+        return count
+
+    @staticmethod
+    def _quarantine_filter(tenant_id: str, doc_id: str | None = None) -> Any:
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        must = [
+            FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)),
+            FieldCondition(key="quarantined", match=MatchValue(value=True)),
+        ]
+        if doc_id is not None:
+            must.append(FieldCondition(key="doc_id", match=MatchValue(value=doc_id)))
+        return Filter(must=must)
 
     def scroll_all(self, limit: int = 50_000, page_size: int = 256) -> list[dict[str, Any]]:
         """Read up to *limit* stored chunks back out of the collection.

@@ -1,4 +1,5 @@
 import { useState, useRef } from 'react'
+import { authHeaders } from '../auth'
 
 const ALLOWED = ['.pdf', '.docx', '.txt']
 
@@ -28,7 +29,7 @@ export default function QueryPanel() {
     accepted.forEach(f => form.append('files', f))
 
     try {
-      const res = await fetch('/ingest', { method: 'POST', body: form })
+      const res = await fetch('/ingest', { method: 'POST', headers: authHeaders(), body: form })
       const data = await res.json()
       if (!res.ok) {
         setErrorMsg(data.detail || 'File indexing failed.')
@@ -65,7 +66,7 @@ export default function QueryPanel() {
     try {
       const res = await fetch('/query', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           query: userText,
           chat_history: nextMessages

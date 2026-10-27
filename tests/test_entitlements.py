@@ -46,6 +46,7 @@ def make_chunks(rng: random.Random, count: int = 240) -> list[dict]:
                 "acl_groups": rng.sample(GROUPS, rng.randint(0, 2)),
                 "acl_public": rng.random() < 0.2,
                 "classification": rng.randint(0, 3),
+                "quarantined": rng.random() < 0.12,
             },
         })
     return chunks
@@ -88,6 +89,16 @@ class TestFilterAndGuardAgree:
             assert got == want, f"{principal}: filter and guard disagree"
             checked_nonempty += bool(want)
         assert checked_nonempty > 150  # the matrix actually exercised visible data
+
+    def test_quarantined_chunks_are_hidden_from_everyone_including_the_owner(self, store):
+        quarantined = [c for c in store.chunks if c["payload"]["quarantined"]]
+        assert len(quarantined) > 10
+        for chunk in quarantined:
+            owner = Principal(user_id=chunk["payload"]["owner_id"], tenant_id=chunk["payload"]["tenant_id"],
+                              groups=frozenset(GROUPS), clearance=3)
+            assert not is_authorized(chunk["payload"], owner)
+            hits = {h["id"] for h in store.client.search(VECTOR, top_k=1000, principal=owner)}
+            assert chunk["id"] not in hits
 
     def test_nothing_crosses_tenants(self, store):
         for tenant in TENANTS:

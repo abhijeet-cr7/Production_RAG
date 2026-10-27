@@ -49,3 +49,6 @@ logs/
 
 # Docker
 docker-compose.override.yml
+
+.env.dev-auth
+.docker-ports.env

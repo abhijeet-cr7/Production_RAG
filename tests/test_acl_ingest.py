@@ -150,8 +150,8 @@ def bearer(user="alice", tenant="eq", groups=("fx", "rates"), clearance=2,
 
 
 def upload(api, content=b"hello world " * 40, headers=None, data=None, name="a.txt"):
-    with patch.object(api.gateway, "DocumentExtractor") as extractor:
-        extractor.return_value.extract.return_value = {
+    with patch.object(api.gateway, "safe_extract_file") as extractor:
+        extractor.return_value = {
             "text": content.decode(), "metadata": {"source": name, "file_type": "txt"},
         }
         return api.client.post(
@@ -189,8 +189,8 @@ class TestIngestStampsAcl:
             assert point["payload"]["owner_id"] == "alice"
 
     def test_extractor_supplied_acl_fields_cannot_override_the_stamp(self, api):
-        with patch.object(api.gateway, "DocumentExtractor") as extractor:
-            extractor.return_value.extract.return_value = {
+        with patch.object(api.gateway, "safe_extract_file") as extractor:
+            extractor.return_value = {
                 "text": "payload " * 50,
                 "metadata": {"tenant_id": "ib", "acl_public": True, "classification": 0, "owner_id": "x"},
             }
@@ -234,7 +234,7 @@ class TestIngestStampsAcl:
                 json={"url": "https://www.sec.gov/x", "acl_groups": ["not-mine"]},
             )
         assert response.status_code == 403
-        extractor.assert_not_called()
+        extractor.return_value.extract.assert_not_called()
 
 
 class TestIdentityOfIdenticalUploads:

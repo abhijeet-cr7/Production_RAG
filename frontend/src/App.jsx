@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import FileUpload from './components/FileUpload'
 import QueryPanel from './components/QueryPanel'
+import TokenBar from './components/TokenBar'
 
 export default function App() {
   const [apiStatus, setApiStatus] = useState('checking') // 'checking' | 'ok' | 'down'
@@ -19,6 +20,7 @@ export default function App() {
             <span className="logo-icon">🧠</span>
             <span className="logo-text">Production RAG</span>
           </div>
+          <TokenBar />
           <div className={`api-badge ${apiStatus}`}>
             <span className="badge-dot" />
             {apiStatus === 'checking' ? 'Checking API…' : apiStatus === 'ok' ? 'API connected' : 'API offline'}
@@ -29,8 +31,8 @@ export default function App() {
       <main className="main">
         {apiStatus === 'down' && (
           <div className="banner-warn">
-            ⚠️ API is unreachable. Start it with:{' '}
-            <code>uvicorn online_pipeline.api.gateway:app --reload</code>
+            ⚠️ API is unreachable. Start the stack with:{' '}
+            <code>./scripts/docker-up.sh</code>
           </div>
         )}
         <div className="grid">

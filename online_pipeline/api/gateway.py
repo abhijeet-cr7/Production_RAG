@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+import re
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, NamedTuple
 
 from urllib.parse import urlsplit
 
@@ -19,10 +20,20 @@ from pydantic import BaseModel, ConfigDict, Field
 from config.settings import settings
 from offline_pipeline.chunkers.router import ChunkingStrategyRouter
 from offline_pipeline.extractors.api_extractor import APIExtractor
-from offline_pipeline.extractors.document_extractor import DocumentExtractor
-from offline_pipeline.extractors.web_extractor import WebExtractor
+from offline_pipeline.extractors.api_extractor import API_CONTENT_TYPES
+from offline_pipeline.extractors.web_extractor import URL_CONTENT_TYPES, WebExtractor
 from offline_pipeline.preprocessors.cleaner import TextCleaner
 from offline_pipeline.preprocessors.metadata_enricher import MetadataEnricher
+from offline_pipeline.safety.errors import UnsafeContent
+from offline_pipeline.safety.injection import (
+    MEDIUM,
+    Finding,
+    scan_for_injection,
+    should_quarantine,
+    unicode_findings,
+)
+from offline_pipeline.safety.net import SafeFetcher
+from offline_pipeline.safety.sandbox import safe_extract_file
 from online_pipeline.audit.logger import AuditError, get_audit, record
 from online_pipeline.auth.acl import ACLError, DocumentACL, authorize, build_document_acl
 from online_pipeline.auth.deps import require_scope
@@ -34,7 +45,8 @@ from online_pipeline.auth.policy import (
     url_host_allowed,
     web_search_decision,
 )
-from online_pipeline.auth.principal import SCOPE_INGEST, SCOPE_QUERY, Principal
+from online_pipeline.auth.principal import SCOPE_ADMIN, SCOPE_INGEST, SCOPE_QUERY, Principal
+from online_pipeline.auth.ratelimit import RateLimiter
 from online_pipeline.auth.tokens import validate_auth_config
 from online_pipeline.cache.embedding_cache import EmbeddingCache, embed_text, embed_texts
 from online_pipeline.context_builder.builder import ContextBuilder
@@ -81,7 +93,9 @@ class QueryResponse(BaseModel):
 
 class IngestFileResult(BaseModel):
     filename: str
-    status: str  # "indexed" | "error"
+    # "indexed" | "quarantined" (stored but hidden pending review) |
+    # "rejected" (failed a security check) | "error"
+    status: str
     chunks_indexed: int = 0
     doc_id: str = ""
     detail: str = ""
@@ -112,6 +126,8 @@ class IngestSourceResponse(BaseModel):
     source: str
     chunks_indexed: int
     doc_id: str
+    status: str = "indexed"  # "indexed" | "quarantined"
+    screen_flags: list[str] = Field(default_factory=list)
 
 
 # ── Dependency singletons (initialised at startup) ───────────────────────────
@@ -193,14 +209,31 @@ async def health() -> dict:
     }
 
 
+class IndexResult(NamedTuple):
+    doc_id: str
+    chunks: int
+    quarantined: bool = False
+    rules: tuple[str, ...] = ()
+
+
 @traced(name="index_document", run_type="chain")
-def _index_document(doc: dict, principal: Principal, acl: DocumentACL) -> tuple[str, int]:
-    """Clean, enrich, chunk, embed and upsert *doc*. Returns (doc_id, chunk count).
+def _index_document(doc: dict, principal: Principal, acl: DocumentACL) -> IndexResult:
+    """Screen, clean, enrich, chunk, embed and upsert *doc*.
 
     Every chunk is stamped with *acl*; tenant and owner come from the token, so
-    nothing in the request can change who owns a document.
+    nothing in the request can change who owns a document. Content that trips the
+    injection screen is stored but marked ``quarantined``: invisible to retrieval
+    until an administrator releases it.
     """
+    metadata = doc.setdefault("metadata", {})
+    findings: list[Finding] = unicode_findings(doc["text"])  # needs the raw text
     doc["text"] = TextCleaner().clean(doc["text"])
+    findings += scan_for_injection(doc["text"] + "\n" + str(metadata.get("title", "")))
+    if any(metadata.get(k) for k in ("hidden_chars_removed", "hidden_elements_removed", "hidden_runs_removed")):
+        findings.append(Finding("hidden_content_removed", MEDIUM))
+    quarantined = should_quarantine(findings)
+    rules = tuple(sorted({f.rule for f in findings}))
+
     doc = MetadataEnricher().enrich(
         doc, tenant_id=principal.tenant_id, owner_id=principal.user_id
     )
@@ -217,10 +250,10 @@ def _index_document(doc: dict, principal: Principal, acl: DocumentACL) -> tuple[
 
     # One batched embed call for the whole document, and one upsert: embedding
     # per chunk dominated ingest time, and a round trip per chunk followed it.
-    acl_payload = acl.as_payload()
+    stamp = {**acl.as_payload(), "quarantined": quarantined, "screen_flags": list(rules)}
     for chunk in chunks:
         # Authoritative stamp: overrides anything an extractor or chunker set.
-        chunk["metadata"].update(acl_payload)
+        chunk["metadata"].update(stamp)
 
     vectors = embed_texts([chunk["text"] for chunk in chunks])
 
@@ -240,7 +273,7 @@ def _index_document(doc: dict, principal: Principal, acl: DocumentACL) -> tuple[
         })
     _vector_db.upsert(points)
 
-    return doc["metadata"]["doc_id"], len(chunks)
+    return IndexResult(doc["metadata"]["doc_id"], len(chunks), quarantined, rules)
 
 
 def _resolve_acl(
@@ -280,19 +313,31 @@ def _audit_ingest(
     doc_id: str | None = None,
     chunks: int = 0,
     reason: str | None = None,
+    flags: tuple[str, ...] = (),
 ) -> None:
     """One audit event per ingested source; origin is fingerprinted, not stored."""
+    decision = {"indexed": "allow", "quarantined": "quarantine", "rejected": "reject"}.get(status, "error")
     record(
         "ingest",
         actor=principal,
         resource={"doc_id": doc_id} if doc_id else None,
-        decision="allow" if status == "indexed" else "error",
+        decision=decision,
         reason=reason,
         source_type=source_type,
         origin_fp=get_audit().fingerprint(origin),
         status=status,
         chunks=chunks,
+        screen_flags=list(flags),
     )
+
+
+# Rejection codes that mean "the request itself was a policy violation" (403),
+# as opposed to the remote content simply being unusable (422).
+_POLICY_REJECTIONS = frozenset({"ssrf_blocked", "host_not_allowed", "dns_failure"})
+
+
+def _rejection_status(code: str) -> int:
+    return 403 if code in _POLICY_REJECTIONS or code.startswith("url_") else 422
 
 
 def _require_url_ingest(principal: Principal, url: str, source_type: str) -> None:
@@ -316,6 +361,86 @@ def _require_url_ingest(principal: Principal, url: str, source_type: str) -> Non
     )
 
 
+_fetch_limiter = RateLimiter(settings.ingest_rate_limit_per_minute)
+
+
+def _enforce_fetch_rate_limit(principal: Principal, source_type: str) -> None:
+    if _fetch_limiter.allow(f"{principal.tenant_id}:{principal.user_id}"):
+        return
+    record(
+        "policy.deny",
+        actor=principal,
+        decision="deny",
+        reason="rate_limited",
+        resource="outbound_fetch",
+        source_type=source_type,
+    )
+    raise HTTPException(
+        status_code=429, detail="Too many ingest requests; slow down.", headers={"Retry-After": "60"}
+    )
+
+
+def _fetcher_for(principal: Principal, content_types: dict[str, str]) -> SafeFetcher:
+    """A fetcher bound to the caller's tenant allow-list and the configured caps."""
+    allow_http = settings.ingest_allow_http and settings.app_env == "dev"
+    return SafeFetcher(
+        allowlist=_policy_for(principal).url_allowlist,
+        max_bytes=settings.ingest_max_fetch_bytes,
+        max_redirects=settings.ingest_max_redirects,
+        total_timeout=settings.ingest_fetch_timeout_seconds,
+        allow_http=allow_http,
+        allowed_ports=(80, 443) if allow_http else (443,),
+        allowed_content_types=content_types,
+    )
+
+
+def _parser_limits() -> dict:
+    return {
+        "timeout": settings.parser_timeout_seconds,
+        "cpu_seconds": settings.parser_cpu_seconds,
+        "max_memory_mb": settings.parser_max_memory_mb,
+        "max_pages": settings.pdf_max_pages,
+        "max_chars": settings.extracted_text_max_chars,
+        "ocr_max_pages": settings.pdf_ocr_max_pages,
+    }
+
+
+def _extract_upload(path: str, suffix: str) -> dict:
+    """Parse an uploaded file in the resource-limited sandbox subprocess."""
+    return safe_extract_file(path, suffix, **_parser_limits())
+
+
+def _display_name(filename: str) -> str:
+    """Basename without control characters: what we store and show as the source.
+
+    Over-long names are shortened in the stem so the extension survives; the
+    extension is what decides whether the file is accepted at all.
+    """
+    name = re.sub(r"[\x00-\x1f\x7f]", "", Path(filename.replace("\\", "/")).name)
+    if len(name) <= 200:
+        return name
+    suffix = Path(name).suffix[:16]
+    return name[: 200 - len(suffix)] + suffix
+
+
+async def _save_upload(file: UploadFile, suffix: str) -> str:
+    """Stream *file* to a temp path, refusing anything over the size cap."""
+    total = 0
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        path = tmp.name
+        try:
+            while chunk := await file.read(1024 * 1024):
+                total += len(chunk)
+                if total > settings.ingest_max_upload_bytes:
+                    raise UnsafeContent("file_too_large", "File exceeds the upload size limit.")
+                tmp.write(chunk)
+        except BaseException:
+            tmp.close()
+            Path(path).unlink(missing_ok=True)
+            raise
+    return path
+
+
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest(
     files: list[UploadFile] = File(...),
@@ -326,8 +451,9 @@ async def ingest(
 ) -> IngestResponse:
     """Upload and index one or more documents (PDF, DOCX, or TXT).
 
-    Each file runs through the full offline pipeline:
-    extract → clean → enrich → chunk → embed → upsert.
+    Each file is size-capped, type-checked, parsed in a sandboxed subprocess,
+    screened, and only then runs through the offline pipeline:
+    clean → enrich → chunk → embed → upsert.
     Files are processed independently; a failure in one does not abort the rest.
     """
     acl = _resolve_acl(
@@ -336,7 +462,7 @@ async def ingest(
     results: list[IngestFileResult] = []
 
     for file in files:
-        filename = file.filename or ""
+        filename = _display_name(file.filename or "")
         suffix = Path(filename).suffix.lower()
         if suffix not in _ALLOWED_EXTENSIONS:
             results.append(IngestFileResult(
@@ -347,23 +473,33 @@ async def ingest(
             _audit_ingest(principal, "file", filename, "error", reason="unsupported_type")
             continue
 
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
-
+        tmp_path: str | None = None
         try:
-            doc = DocumentExtractor().extract(tmp_path)
-            doc["metadata"].setdefault("source", filename)
-            doc["metadata"].setdefault("file_type", suffix.lstrip("."))
+            tmp_path = await _save_upload(file, suffix)
+            doc = await run_in_threadpool(_extract_upload, tmp_path, suffix)
+            # The extractor knows nothing about the user's file name, and must
+            # never leave a server temp path as the "source" shown to users.
+            doc["metadata"]["source"] = filename
+            doc["metadata"]["file_type"] = suffix.lstrip(".")
 
-            doc_id, chunk_count = _index_document(doc, principal, acl)
+            indexed = await run_in_threadpool(_index_document, doc, principal, acl)
+            status = "quarantined" if indexed.quarantined else "indexed"
             results.append(IngestFileResult(
                 filename=filename,
-                status="indexed",
-                chunks_indexed=chunk_count,
-                doc_id=doc_id,
+                status=status,
+                chunks_indexed=indexed.chunks,
+                doc_id=indexed.doc_id,
+                detail=(f"Held for review (matched: {', '.join(indexed.rules)})"
+                        if indexed.quarantined else ""),
             ))
-            _audit_ingest(principal, "file", filename, "indexed", doc_id=doc_id, chunks=chunk_count)
+            _audit_ingest(principal, "file", filename, status, doc_id=indexed.doc_id,
+                          chunks=indexed.chunks, flags=indexed.rules)
+        except UnsafeContent as exc:
+            results.append(IngestFileResult(
+                filename=filename, status="rejected",
+                detail=f"Rejected by security checks ({exc.code}): {exc.detail}",
+            ))
+            _audit_ingest(principal, "file", filename, "rejected", reason=exc.code)
         except HTTPException as exc:
             results.append(IngestFileResult(filename=filename, status="error", detail=str(exc.detail)))
             _audit_ingest(principal, "file", filename, "error", reason=f"http_{exc.status_code}")
@@ -371,9 +507,10 @@ async def ingest(
             results.append(IngestFileResult(filename=filename, status="error", detail=str(exc)))
             _audit_ingest(principal, "file", filename, "error", reason=type(exc).__name__)
         finally:
-            Path(tmp_path).unlink(missing_ok=True)
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
 
-    if all(r.status == "error" for r in results):
+    if all(r.status in {"error", "rejected"} for r in results):
         raise HTTPException(status_code=400, detail="; ".join(f"{r.filename}: {r.detail}" for r in results))
 
     # New chunks are invisible to the lexical branch until the index is rebuilt.
@@ -385,15 +522,17 @@ async def ingest(
     )
 
 
-@app.post("/ingest/url", response_model=IngestSourceResponse)
-async def ingest_url(
-    request: IngestUrlRequest,
-    principal: Principal = Depends(require_scope(SCOPE_INGEST)),
+async def _ingest_remote(
+    principal: Principal,
+    request: IngestUrlRequest | IngestApiRequest,
+    source_type: str,
+    fetch: "callable",
 ) -> IngestSourceResponse:
-    """Scrape a web page and index its text content."""
+    """Shared flow for /ingest/url and /ingest/api: policy, ACL, safe fetch, index."""
     if not request.url.strip().lower().startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
-    _require_url_ingest(principal, request.url, "url")
+    _require_url_ingest(principal, request.url, source_type)
+    _enforce_fetch_rate_limit(principal, source_type)
     acl = _resolve_acl(
         principal,
         acl_groups=request.acl_groups,
@@ -402,15 +541,40 @@ async def ingest_url(
     )
 
     try:
-        doc = WebExtractor().extract(request.url.strip())
-    except Exception as exc:  # noqa: BLE001
-        _audit_ingest(principal, "url", request.url, "error", reason=type(exc).__name__)
-        raise HTTPException(status_code=422, detail=f"Failed to fetch URL: {exc}") from exc
+        doc = await run_in_threadpool(fetch)
+    except UnsafeContent as exc:
+        _audit_ingest(principal, source_type, request.url, "rejected", reason=exc.code)
+        if exc.code in _POLICY_REJECTIONS or exc.code.startswith("url_"):
+            record(
+                "policy.deny", actor=principal, decision="deny", reason=exc.code,
+                resource="outbound_fetch", source_type=source_type,
+            )
+        raise HTTPException(
+            status_code=_rejection_status(exc.code),
+            detail=f"Rejected by security checks ({exc.code}): {exc.detail}",
+        ) from exc
 
-    doc_id, chunk_count = _index_document(doc, principal, acl)
-    _audit_ingest(principal, "url", request.url, "indexed", doc_id=doc_id, chunks=chunk_count)
+    indexed = await run_in_threadpool(_index_document, doc, principal, acl)
+    status = "quarantined" if indexed.quarantined else "indexed"
+    _audit_ingest(principal, source_type, request.url, status, doc_id=indexed.doc_id,
+                  chunks=indexed.chunks, flags=indexed.rules)
     await run_in_threadpool(_refresh_lexical_index)
-    return IngestSourceResponse(source=request.url, chunks_indexed=chunk_count, doc_id=doc_id)
+    return IngestSourceResponse(
+        source=request.url, chunks_indexed=indexed.chunks, doc_id=indexed.doc_id,
+        status=status, screen_flags=list(indexed.rules),
+    )
+
+
+@app.post("/ingest/url", response_model=IngestSourceResponse)
+async def ingest_url(
+    request: IngestUrlRequest,
+    principal: Principal = Depends(require_scope(SCOPE_INGEST)),
+) -> IngestSourceResponse:
+    """Fetch a web page through the SSRF-safe fetcher, sanitise it and index it."""
+    extractor = WebExtractor(_fetcher_for(principal, URL_CONTENT_TYPES), _parser_limits())
+    return await _ingest_remote(
+        principal, request, "url", lambda: extractor.extract(request.url.strip())
+    )
 
 
 @app.post("/ingest/api", response_model=IngestSourceResponse)
@@ -418,31 +582,44 @@ async def ingest_api(
     request: IngestApiRequest,
     principal: Principal = Depends(require_scope(SCOPE_INGEST)),
 ) -> IngestSourceResponse:
-    """Fetch JSON from a REST endpoint and index it."""
-    if not request.url.strip().lower().startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
-    _require_url_ingest(principal, request.url, "api")
-    acl = _resolve_acl(
-        principal,
-        acl_groups=request.acl_groups,
-        acl_public=request.acl_public,
-        classification=request.classification,
+    """Fetch JSON from a REST endpoint through the SSRF-safe fetcher and index it."""
+    extractor = APIExtractor(_fetcher_for(principal, API_CONTENT_TYPES))
+    return await _ingest_remote(
+        principal, request, "api",
+        lambda: extractor.extract(
+            request.url.strip(), params=request.params, text_fields=request.text_fields
+        ),
     )
 
-    try:
-        doc = APIExtractor().extract(
-            request.url.strip(),
-            params=request.params,
-            text_fields=request.text_fields,
-        )
-    except Exception as exc:  # noqa: BLE001
-        _audit_ingest(principal, "api", request.url, "error", reason=type(exc).__name__)
-        raise HTTPException(status_code=422, detail=f"Failed to fetch API: {exc}") from exc
 
-    doc_id, chunk_count = _index_document(doc, principal, acl)
-    _audit_ingest(principal, "api", request.url, "indexed", doc_id=doc_id, chunks=chunk_count)
+# ── Quarantine review (tenant administrators) ───────────────────────────────
+
+@app.get("/admin/quarantine")
+async def list_quarantine(
+    principal: Principal = Depends(require_scope(SCOPE_ADMIN)),
+) -> dict:
+    """Documents held back by the injection screen, for this tenant only."""
+    documents = await run_in_threadpool(_vector_db.list_quarantined, principal.tenant_id)
+    record("quarantine.list", actor=principal, count=len(documents))
+    return {"documents": documents}
+
+
+@app.post("/admin/quarantine/{doc_id}/release")
+async def release_quarantine(
+    doc_id: str,
+    principal: Principal = Depends(require_scope(SCOPE_ADMIN)),
+) -> dict:
+    """Make a reviewed, quarantined document retrievable again."""
+    released = await run_in_threadpool(
+        _vector_db.release_quarantine, principal.tenant_id, doc_id, principal.user_id
+    )
+    if not released:
+        raise HTTPException(status_code=404, detail="No quarantined document with that id.")
+    record(
+        "quarantine.release", actor=principal, resource={"doc_id": doc_id}, chunks=released
+    )
     await run_in_threadpool(_refresh_lexical_index)
-    return IngestSourceResponse(source=request.url, chunks_indexed=chunk_count, doc_id=doc_id)
+    return {"doc_id": doc_id, "chunks_released": released}
 
 
 @traced(name="query_rewrite", run_type="llm")
