@@ -20,6 +20,24 @@ class ContextBuilder:
 
     # ── public API ───────────────────────────────────────────────────────────
 
+    def select(self, chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The chunks that fit the budget, in order. Citation ``[n]`` is position n here."""
+        included: list[dict[str, Any]] = []
+        token_budget = self.max_tokens
+        for chunk in chunks:
+            block = self._format(len(included) + 1, chunk)
+            meta = chunk.get("metadata", {})
+            estimated_tokens = len(block.split())
+            if meta.get("block_kind") in ("table", "xbrl_facts"):
+                # Numbers tokenise far worse than words ("391,035" is several tokens),
+                # so a whitespace count would let tables overrun the model's budget.
+                estimated_tokens = max(estimated_tokens, len(block) // 3)
+            if token_budget <= 0 or estimated_tokens > token_budget:
+                break
+            included.append(chunk)
+            token_budget -= estimated_tokens
+        return included
+
     def build(self, chunks: list[dict[str, Any]]) -> str:
         """Return a formatted context string from *chunks*.
 
@@ -33,27 +51,13 @@ class ContextBuilder:
         Returns:
             Formatted context string ready to be injected into an LLM prompt.
         """
-        parts: list[str] = []
-        token_budget = self.max_tokens
+        return self.separator.join(
+            self._format(i, chunk) for i, chunk in enumerate(self.select(chunks), start=1)
+        )
 
-        for i, chunk in enumerate(chunks, start=1):
-            text = chunk.get("text", "").strip()
-            meta = chunk.get("metadata", {})
-            source = meta.get("source", "")
-
-            header = f"[{i}] Source: {source}" if source else f"[{i}]"
-            block = f"{header}\n{text}"
-
-            estimated_tokens = len(block.split())
-            if meta.get("block_kind") in ("table", "xbrl_facts"):
-                # Numbers tokenise far worse than words ("391,035" is several tokens),
-                # so a whitespace count would let tables overrun the model's budget.
-                estimated_tokens = max(estimated_tokens, len(block) // 3)
-            if token_budget <= 0:
-                break
-            if estimated_tokens > token_budget:
-                break
-            parts.append(block)
-            token_budget -= estimated_tokens
-
-        return self.separator.join(parts)
+    @staticmethod
+    def _format(index: int, chunk: dict[str, Any]) -> str:
+        text = chunk.get("text", "").strip()
+        source = (chunk.get("metadata") or {}).get("source", "")
+        header = f"[{index}] Source: {source}" if source else f"[{index}]"
+        return f"{header}\n{text}"

@@ -105,6 +105,7 @@ class Settings(BaseSettings):
 
     # ── Answer safety ────────────────────────────────────────────────────────
     require_citations: bool = True       # figures and answers must cite [n] sources
+    answer_verification_enabled: bool = True   # deterministic citation + figure checks
 
     # ── Authentication (Okta) ────────────────────────────────────────────────
     app_env: str = "dev"              # "dev" | "staging" | "prod"

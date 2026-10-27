@@ -51,12 +51,17 @@ from online_pipeline.auth.policy import (
 from online_pipeline.auth.principal import SCOPE_ADMIN, SCOPE_INGEST, SCOPE_QUERY, Principal
 from online_pipeline.auth.ratelimit import RateLimiter
 from online_pipeline.auth.tokens import validate_auth_config
+from online_pipeline.answer_safety.advice import REFUSAL as ADVICE_REFUSAL
+from online_pipeline.answer_safety.advice import is_investment_advice_request
+from online_pipeline.answer_safety.sanitize import sanitize_answer
+from online_pipeline.answer_safety.verify import Verification, verify_answer
 from online_pipeline.cache.embedding_cache import EmbeddingCache, embed_text, embed_texts
 from online_pipeline.provenance.rawstore import RawStore
 from online_pipeline.provenance.trust import (
     Provenance,
     ProvenanceError,
     check_expected_hash,
+    host_of,
     normalise_expected_hash,
     for_remote,
     for_upload,
@@ -108,6 +113,11 @@ class QueryResponse(BaseModel):
     # Provenance summary of the sources actually used, e.g. {"verified_primary": 2}.
     trust_summary: dict[str, int] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    # Deterministic check of citations and figures against the cited sources.
+    verification: dict | None = None
+    # True when a person should look before this is relied on: restricted sources
+    # were used, a figure failed verification, or the answer was not grounded.
+    needs_review: bool = False
 
 
 class IngestFileResult(BaseModel):
@@ -829,6 +839,41 @@ def _stage_grade(query: str, context: str, answer: str) -> GradeResult | None:
     return _llm_router.grade_answer(query, context, answer)
 
 
+@traced(name="verify_answer", run_type="chain")
+def _stage_verify(answer: str, included: list[dict]) -> Verification:
+    return verify_answer(answer, included, require_citations=settings.require_citations)
+
+
+def _included_chunks(chunks: list[dict]) -> list[dict]:
+    """The chunks the prompt actually contains, in order: citation [n] is position n."""
+    return chunks if _context_builder is None else _context_builder.select(chunks)
+
+
+def _evaluate(
+    query: str, context: str, included: list[dict], answer: str
+) -> tuple[GradeResult | None, Verification | None]:
+    grade = _stage_grade(query, context, answer) if settings.answer_grading_enabled else None
+    verification = _stage_verify(answer, included) if settings.answer_verification_enabled else None
+    return grade, verification
+
+
+def _needs_work(grade: GradeResult | None, verification: Verification | None) -> bool:
+    return (grade is not None and not grade.grounded) or (verification is not None and not verification.ok)
+
+
+def _unacceptable(grade: GradeResult | None, verification: Verification | None) -> bool:
+    return (grade is not None and not grade.acceptable) or (verification is not None and not verification.ok)
+
+
+def _combined_feedback(grade: GradeResult | None, verification: Verification | None) -> str | None:
+    parts = []
+    if grade is not None and not grade.acceptable:
+        parts.append(grade.feedback())
+    if verification is not None and not verification.ok:
+        parts.append(verification.feedback())
+    return " ".join(parts) or None
+
+
 @app.post("/query", response_model=QueryResponse)
 @traced(name="rag_query", run_type="chain")
 async def query(
@@ -862,6 +907,12 @@ async def query(
 def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryResponse, dict]:
     policy = _policy_for(principal)
 
+    # Declined before any retrieval or model call: documents can tell you what a
+    # filing reports, not what you should buy.
+    if policy.refuse_investment_advice and is_investment_advice_request(request.query):
+        refusal = QueryResponse(answer=ADVICE_REFUSAL, sources=[], warnings=["refused_investment_advice"])
+        return refusal, {"refused": "investment_advice", "n_sources": 0, "returned_doc_ids": []}
+
     rewritten = _stage_rewrite(request.query)
     embedding = _stage_embed(rewritten)
     guard = _AclGuard(principal, policy)
@@ -890,44 +941,41 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
             web_denied = deny_reason
 
     context = _stage_build_context(reranked)
+    included = _included_chunks(reranked)
     answer = _stage_generate(request.query, context, request.chat_history)
     attempts = 1
+    grade, verification = _evaluate(request.query, context, included, answer)
 
-    grade: GradeResult | None = None
-    ungrounded_policy_applied = False
-    if settings.answer_grading_enabled:
-        grade = _stage_grade(request.query, context, answer)
+    # A draft that is ungrounded or whose figures do not check out is regenerated
+    # with specific feedback, bounded by max_generation_attempts so a stubborn
+    # model cannot loop forever.
+    while _needs_work(grade, verification) and attempts < settings.max_generation_attempts:
+        answer = _stage_generate(
+            request.query, context, request.chat_history, _combined_feedback(grade, verification)
+        )
+        attempts += 1
+        grade, verification = _evaluate(request.query, context, included, answer)
 
-        # Ungrounded draft: regenerate with the grader's feedback, bounded by
-        # max_generation_attempts so a stubborn model cannot loop forever.
-        while (
-            grade is not None
-            and not grade.grounded
-            and attempts < settings.max_generation_attempts
-        ):
-            answer = _stage_generate(request.query, context, request.chat_history, grade.feedback())
-            attempts += 1
-            grade = _stage_grade(request.query, context, answer)
+    # Still unusable and the web has not been tried: the context itself is the
+    # problem, so fetch fresh evidence and make one last attempt.
+    if _unacceptable(grade, verification) and not web_search_used:
+        if allow_web:
+            topped_up = _web_top_up(rewritten, candidates, request.top_k, principal, policy)
+            if topped_up is not None:
+                reranked, web_search_used = guard.filter(topped_up), True
+                context = _stage_build_context(reranked)
+                included = _included_chunks(reranked)
+                answer = _stage_generate(
+                    request.query, context, request.chat_history, _combined_feedback(grade, verification)
+                )
+                attempts += 1
+                grade, verification = _evaluate(request.query, context, included, answer)
+        elif deny_reason in POLICY_DENIALS:
+            web_denied = deny_reason
 
-        # Still unusable and the web has not been tried: the context itself is
-        # the problem, so fetch fresh evidence and make one last attempt.
-        if grade is not None and not grade.acceptable and not web_search_used:
-            if allow_web:
-                topped_up = _web_top_up(rewritten, candidates, request.top_k, principal, policy)
-                if topped_up is not None:
-                    reranked, web_search_used = guard.filter(topped_up), True
-                    context = _stage_build_context(reranked)
-                    answer = _stage_generate(
-                        request.query, context, request.chat_history, grade.feedback()
-                    )
-                    attempts += 1
-                    grade = _stage_grade(request.query, context, answer)
-            elif deny_reason in POLICY_DENIALS:
-                web_denied = deny_reason
-
-        if grade is not None and not grade.grounded:
-            answer = _apply_ungrounded_policy(answer, policy)
-            ungrounded_policy_applied = True
+    ungrounded = grade is not None and not grade.grounded
+    figures_failed = verification is not None and not verification.ok
+    answer, policies_applied = _apply_answer_policies(answer, policy, ungrounded, verification)
 
     if guard.dropped:
         # The pre-filter should have made this impossible: treat as an incident.
@@ -950,6 +998,14 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
         )
 
     metadata_used = [r.get("metadata", {}) for r in reranked]
+
+    # What leaves the service is plain text: no images, HTML or URLs except the
+    # answer's own sources, whatever a poisoned document told the model to emit.
+    allowed_hosts = {host_of(str(m.get("origin", ""))) for m in metadata_used} - {""}
+    answer, sanitize_flags = sanitize_answer(answer, allowed_hosts)
+    if policy.answer_disclaimer:
+        answer = f"{answer}\n\n{policy.answer_disclaimer}"
+
     sources = [public_source(m) for m in metadata_used]  # never expose ACL internals
     trust_summary: dict[str, int] = {}
     for m in metadata_used:
@@ -958,6 +1014,16 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
     warnings: list[str] = []
     if trust_summary.get("unverified"):
         warnings.append("unverified_sources_used")
+    if figures_failed:
+        warnings.append("figures_unverified")
+    if ungrounded:
+        warnings.append("ungrounded")
+    if sanitize_flags:
+        warnings.append("output_sanitized")
+    needs_review = bool(
+        ungrounded or figures_failed
+        or any(int(m.get("classification", 0) or 0) >= 2 for m in metadata_used)
+    )
     response = QueryResponse(
         answer=answer,
         sources=sources,
@@ -967,6 +1033,8 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
         grounded=None if grade is None else grade.grounded,
         answer_useful=None if grade is None else grade.answers_question,
         generation_attempts=attempts,
+        verification=None if verification is None else verification.summary(),
+        needs_review=needs_review,
     )
     audit_details = {
         "returned_doc_ids": [m["doc_id"] for m in sources if m.get("doc_id")][:50],
@@ -979,7 +1047,14 @@ def _answer_query(request: QueryRequest, principal: Principal) -> tuple[QueryRes
         "grounded": response.grounded,
         "answer_useful": response.answer_useful,
         "attempts": attempts,
-        "ungrounded_policy_applied": ungrounded_policy_applied,
+        "policies_applied": policies_applied,
+        "verification": None if verification is None else {
+            "ok": verification.ok, "abstained": verification.abstained,
+            "counts": verification.summary()["counts"],
+            "invalid_citations": verification.invalid_citations,
+        },
+        "output_sanitized": sanitize_flags,
+        "needs_review": needs_review,
     }
     return response, audit_details
 
@@ -1046,16 +1121,45 @@ class _AclGuard:
         return trusted
 
 
-def _apply_ungrounded_policy(answer: str, policy: TenantPolicy) -> str:
-    if policy.ungrounded_answer_policy == "abstain":
-        return (
-            "I could not produce an answer that is fully supported by the "
-            "available sources, so I am not going to guess."
-        )
-    return (
-        "Note: parts of this answer could not be verified against the sources.\n\n"
-        + answer
-    )
+_UNGROUNDED_REFUSAL = (
+    "I could not produce an answer that is fully supported by the "
+    "available sources, so I am not going to guess."
+)
+_FIGURES_REFUSAL = (
+    "I could not verify the figures in this answer against the cited sources, "
+    "so I am not going to present them."
+)
+
+
+def _apply_answer_policies(
+    answer: str, policy: TenantPolicy, ungrounded: bool, verification: Verification | None
+) -> tuple[str, list[str]]:
+    """Apply the tenant's warn/abstain rules for ungrounded text and unverified figures."""
+    figures_failed = verification is not None and not verification.ok
+    if not ungrounded and not figures_failed:
+        return answer, []
+
+    applied = []
+    if ungrounded:
+        applied.append(f"ungrounded:{policy.ungrounded_answer_policy}")
+    if figures_failed:
+        applied.append(f"figures:{policy.numeric_mismatch_policy}")
+
+    if (ungrounded and policy.ungrounded_answer_policy == "abstain") or (
+        figures_failed and policy.numeric_mismatch_policy == "abstain"
+    ):
+        return (_UNGROUNDED_REFUSAL if ungrounded else _FIGURES_REFUSAL), applied
+
+    notes = []
+    if ungrounded:
+        notes.append("Note: parts of this answer could not be verified against the sources.")
+    if figures_failed:
+        bad = ", ".join(dict.fromkeys(c.text for c in verification.failed)) if verification else ""
+        if verification is not None and not verification.has_citation:
+            notes.append("Note: this answer does not cite its sources.")
+        if bad:
+            notes.append(f"Note: these figures could not be verified against the cited sources: {bad}.")
+    return "\n".join(notes) + "\n\n" + answer, applied
 
 
 def _local_recall_is_weak(candidates: list[dict], reranked: list[dict]) -> bool:

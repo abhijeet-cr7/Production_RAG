@@ -34,7 +34,8 @@ NOT_FOUND = "not_found"
 PERIOD_MISMATCH = "period_mismatch"
 UNIT_MISMATCH = "unit_mismatch"
 UNCITED = "uncited"
-FAILED = {NOT_FOUND, PERIOD_MISMATCH, UNIT_MISMATCH, UNCITED}
+SIGN_MISMATCH = "sign_mismatch"
+FAILED = {NOT_FOUND, PERIOD_MISMATCH, UNIT_MISMATCH, UNCITED, SIGN_MISMATCH}
 
 _CITATION = re.compile(r"\[(\d+(?:\s*[,;]\s*\d+)*)\]")
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\[\(\"'•-])|\n+")
@@ -49,11 +50,24 @@ _NON_CLAIM_TOKENS = [
     re.compile(r"\bFY\s?\d{2,4}\b", re.I),
     re.compile(r"\b[HQ][1-4]\b(?:\s*(?:19|20)\d{2})?", re.I),
     re.compile(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b"),
-    re.compile(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:,\s*(?:19|20)\d{2})?", re.I),
+    # A whole month token, never a prefix: "Dec[a-z]*" would eat "decreased 1.8%".
+    re.compile(
+        r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December"
+        r"|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\b\.?\s+\d{1,2}(?!\d)(?:,\s*(?:19|20)\d{2})?",
+        re.I,
+    ),
     re.compile(r"(?m)^\s*\d{1,2}[.)]\s"),
     re.compile(r"\b(?:Item|Note|Table|Figure|Exhibit|Section|Page|Part)\s+\d+[A-Za-z]?(?:\.\d+)?", re.I),
 ]
 # Not \b: "FY2023" has no word boundary between the Y and the 2.
+_DOWN = re.compile(
+    r"\b(?:fell|fall|falls|falling|decreas\w*|declin\w*|drop\w*|down|lower|reduc\w*|shrank|shrunk|shrink\w*|"
+    r"contract\w*|slump\w*|lost|losses|loss|dipped|slid)\b", re.I)
+_UP = re.compile(
+    r"\b(?:rose|rise|rises|rising|grew|grow\w*|increas\w*|up|higher|gain\w*|expand\w*|climb\w*|surg\w*|jump\w*)\b", re.I)
+_DIRECTION_WINDOW = 45
+# [^;\n], not [^.;]: the span contains figures like "$391.0" with their own decimal points.
+_TO_BEFORE_FROM = re.compile(r"\bto\b[^;\n]{0,60}\bfrom\b", re.I)
 _YEAR = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
 
 
@@ -95,6 +109,7 @@ class Verification:
                 NOT_FOUND: "does not appear in the cited sources",
                 PERIOD_MISMATCH: "is from a different period than the one you stated",
                 UNIT_MISMATCH: "uses a different currency or unit than the source",
+                SIGN_MISMATCH: "has the opposite sign or direction to the source (e.g. a rise reported as a fall)",
                 UNCITED: "has no citation",
             }[check.status]
             problems.append(f"The figure '{check.text}' {reason}.")
@@ -127,9 +142,20 @@ def _dec(value: Any) -> Decimal | None:
         return None
 
 
+def _direction(text: str, position: int) -> int | None:
+    """+1 / -1 if the words just before *position* say the quantity rose / fell, else None."""
+    window = text[max(0, position - _DIRECTION_WINDOW): position]
+    last_down = max((m.end() for m in _DOWN.finditer(window)), default=-1)
+    last_up = max((m.end() for m in _UP.finditer(window)), default=-1)
+    if last_down == last_up:
+        return None
+    return -1 if last_down > last_up else 1
+
+
 @dataclass
 class _Candidate:
-    value: Decimal
+    value: Decimal                  # magnitude
+    sign: int | None                # +1/-1 when the source states it, None when it does not
     kind: str
     currency: str
     year: str
@@ -152,14 +178,17 @@ def _candidates(chunk: dict[str, Any], ref: int) -> list[_Candidate]:
         value = _dec(entry.get("value"))
         if value is None:
             continue
+        kind = str(entry.get("kind", "number"))
         out.append(_Candidate(
-            value=abs(value), kind=str(entry.get("kind", "number")),
-            currency=str(entry.get("currency") or ""), year=_year_of(entry),
+            value=abs(value), sign=(-1 if value < 0 else 1) if kind == "percent" or value < 0 else None,
+            kind=kind, currency=str(entry.get("currency") or ""), year=_year_of(entry),
             label=f"[{ref}] {entry.get('row', '')} / {entry.get('column', '')}".strip(" /"), ref=ref,
         ))
-    for number in extract_prose_numbers(chunk.get("text", "")):
+    text = chunk.get("text", "")
+    for number in extract_prose_numbers(text):
+        sign = -1 if number.negative else (_direction(text, number.start) if number.kind == "percent" else None)
         out.append(_Candidate(
-            value=abs(number.value), kind=number.kind, currency=number.currency,
+            value=abs(number.value), sign=sign, kind=number.kind, currency=number.currency,
             year="", label=f"[{ref}] {number.text}", ref=ref,
         ))
     return out
@@ -190,19 +219,44 @@ def _kind_compatible(answer: ProseNumber, source: _Candidate) -> bool:
     return True
 
 
-def _derived_matches(target: ProseNumber, operands: list[Decimal]) -> bool:
-    """Is *target* a change %, difference, sum or ratio of any two *operands*?"""
-    pairs = [(a, b) for i, a in enumerate(operands) for b in operands[i + 1:]]
-    for a, b in pairs:
-        for x, y in ((a, b), (b, a)):
-            if x != 0 and target.kind == "percent":
-                for candidate in ((y - x) / x * 100, (x - y) / x * 100, x / y * 100 if y else None):
-                    if candidate is not None and abs(abs(target.value) - abs(candidate)) <= target.quantum:
-                        return True
-            if target.kind != "percent":
-                for candidate in (abs(x - y), x + y):
-                    if abs(abs(target.value) - candidate) <= target.quantum:
-                        return True
+def _derived_matches(
+    target: ProseNumber,
+    sign: int | None,
+    operands: list[tuple[Decimal, Decimal]],
+    reversed_order: bool,
+) -> bool:
+    """Is *target* a change %, difference, sum or ratio of two *operands*?
+
+    Operands are ``(value, quantum)`` in the order they appear in the sentence. They
+    were stated rounded ("$365.8B"), so the derived figure may differ from the target
+    by more than the target's own rounding; the tolerance adds the error the operands'
+    rounding can propagate, and no more. 9.9% is still nowhere near the 2.0% that
+    $383.3B -> $391.0B implies. When the answer states a direction ("fell 2%") the
+    change must have that sign, taking the operands as "from first to second" (or the
+    reverse for "to B from A").
+    """
+    for i, (a, qa) in enumerate(operands):
+        for b, qb in operands[i + 1:]:
+            (x, qx), (y, qy) = ((b, qb), (a, qa)) if reversed_order else ((a, qa), (b, qb))
+            candidates: list[tuple[Decimal, Decimal]] = []
+            if target.kind == "percent":
+                if x != 0:
+                    change = (y - x) / x * 100
+                    error = 100 * (qy / abs(x) + abs(y - x) * qx / (x * x))
+                    if sign is None:
+                        candidates += [(abs(change), error)]
+                    else:
+                        candidates += [(change * sign, error)]
+                if y != 0 and sign is None:
+                    candidates.append((x / y * 100, 100 * (qx / abs(y) + abs(x) * qy / (y * y))))
+                if sign is None and x != 0:       # either orientation is fine without a stated direction
+                    candidates.append((abs((x - y) / y * 100) if y else Decimal(-1), 100 * (qx / abs(y) + abs(x - y) * qy / (y * y)) if y else Decimal(0)))
+            else:
+                candidates += [(abs(x - y), qx + qy), (x + y, qx + qy)]
+            want = abs(target.value)
+            for value, error in candidates:
+                if value >= 0 and abs(want - value) <= target.quantum + error:
+                    return True
     return False
 
 
@@ -240,28 +294,38 @@ def verify_answer(answer: str, chunks: list[dict[str, Any]], *, require_citation
         if not numbers:
             continue
         sentence_years = set(_YEAR.findall(sentence))
+        reversed_order = bool(_TO_BEFORE_FROM.search(text))
 
         pool_refs = cited or list(candidates)
         pool = [c for ref in pool_refs for c in candidates.get(ref, [])]
-        verified_values: list[Decimal] = []
-        pending: list[ProseNumber] = []
+        verified: list[tuple[Decimal, Decimal]] = []
+        pending: list[tuple[ProseNumber, int | None, tuple[_Candidate, str] | None]] = []
 
         for number in numbers:
-            match = _find_match(number, pool, sentence_years)
-            if match is None:
-                pending.append(number)
+            sign = -1 if number.negative else (_direction(text, number.start) if number.kind == "percent" else None)
+            match = _find_match(number, sign, pool, sentence_years)
+            if match is None or match[1] == SIGN_MISMATCH:
+                # Not found, or equal in size to a source figure of the opposite sign.
+                # Either way it may still be a correct derived figure (a fall of 2% that
+                # happens to equal a +2% elsewhere), so try the arithmetic before failing.
+                pending.append((number, sign, match))
                 continue
             candidate, status = match
             if not cited and require_citations:
                 status = UNCITED
             result.checks.append(NumberCheck(number.text, status, sentence, cited, candidate.label))
-            if status in (VERIFIED,):
-                verified_values.append(abs(number.value))
+            if status == VERIFIED:
+                verified.append((abs(number.value), number.quantum))
 
-        for number in pending:
-            if _derived_matches(number, verified_values):
+        for number, sign, fallback in pending:
+            if _derived_matches(number, sign, verified, reversed_order):
                 status = DERIVED if (cited or not require_citations) else UNCITED
                 result.checks.append(NumberCheck(number.text, status, sentence, cited, "derived from figures in the sentence"))
+            elif fallback is not None:
+                candidate, status = fallback
+                if not cited and require_citations:
+                    status = UNCITED
+                result.checks.append(NumberCheck(number.text, status, sentence, cited, candidate.label))
             else:
                 result.checks.append(NumberCheck(number.text, UNCITED if (not cited and require_citations) else NOT_FOUND,
                                                  sentence, cited, ""))
@@ -277,7 +341,7 @@ def _citation_numbers(group: str) -> list[int]:
 
 
 def _find_match(
-    number: ProseNumber, pool: list[_Candidate], sentence_years: set[str]
+    number: ProseNumber, sign: int | None, pool: list[_Candidate], sentence_years: set[str]
 ) -> tuple[_Candidate, str] | None:
     """Best source value for *number*, or None. Prefers a period the sentence names."""
     hits = [c for c in pool if _kind_compatible(number, c) and _close(number, c.value)]
@@ -287,6 +351,13 @@ def _find_match(
     comparable = [c for c in hits if not (number.currency and c.currency and number.currency != c.currency)]
     if not comparable:
         return hits[0], UNIT_MISMATCH
+    # An explicit sign or direction in the answer must agree with the source's, when
+    # the source states one. No stated sign means the magnitude is all that is claimed.
+    if sign is not None:
+        agreeing = [c for c in comparable if c.sign is None or c.sign == sign]
+        if not agreeing:
+            return comparable[0], SIGN_MISMATCH
+        comparable = agreeing
     if sentence_years:
         dated = [c for c in comparable if c.year]
         in_period = [c for c in dated if c.year in sentence_years]
