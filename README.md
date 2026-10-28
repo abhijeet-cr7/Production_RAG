@@ -50,7 +50,7 @@ Useful commands:
 ```bash
 docker compose logs -f api          # follow the API log
 docker compose down                 # stop (keeps your data)
-docker compose down -v              # stop and delete all data (vectors, audit log, model cache)
+docker compose down -v              # stop and delete all data (vectors, originals, audit log, model cache)
 ./scripts/docker-up.sh --no-build   # restart without rebuilding
 ./scripts/docker-up.sh --kafka      # also start Kafka + ZooKeeper (asynchronous ingestion)
 ```

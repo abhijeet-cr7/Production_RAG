@@ -17,15 +17,17 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 10001 app \
- && mkdir -p /var/log/rag /home/app/.cache/huggingface \
- && chown -R app:app /var/log/rag /home/app
+ && mkdir -p /var/log/rag /var/lib/rag/raw /home/app/.cache/huggingface \
+ && chown -R app:app /var/log/rag /var/lib/rag /home/app
 
 WORKDIR /app
 
 # CPU-only torch first: the default x86 wheel drags in multi-GB CUDA libraries.
+# Its own layer, so changing requirements.txt does not download it again.
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+
 COPY requirements.txt .
-RUN pip install torch --index-url https://download.pytorch.org/whl/cpu \
- && pip install -r requirements.txt
+RUN pip install -r requirements.txt
 
 COPY --chown=app:app . .
 USER app

@@ -26,16 +26,16 @@ for arg in "$@"; do
   esac
 done
 
-# service | env var | default host port
-SERVICES="api|API_PORT|8000
-frontend|FRONTEND_PORT|8080
-qdrant|QDRANT_PORT|6333
-qdrant-grpc|QDRANT_GRPC_PORT|6334
-redis|REDIS_PORT|6379"
+# label | env var | default host port | compose service | container port
+SERVICES="api|API_PORT|8000|api|8000
+frontend|FRONTEND_PORT|8080|frontend|80
+qdrant|QDRANT_PORT|6333|qdrant|6333
+qdrant-grpc|QDRANT_GRPC_PORT|6334|qdrant|6334
+redis|REDIS_PORT|6379|redis|6379"
 if [ "$KAFKA" = 1 ]; then
   SERVICES="$SERVICES
-kafka|KAFKA_PORT|9092
-zookeeper|ZOOKEEPER_PORT|2181"
+kafka|KAFKA_PORT|9092|kafka|9092
+zookeeper|ZOOKEEPER_PORT|2181|zookeeper|2181"
 fi
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -59,10 +59,21 @@ port_in_use() {
   return 1
 }
 
+# Turn docker's "Ports" column into one host port per line. Docker collapses
+# consecutive identical mappings into ranges ("0.0.0.0:6333-6334->6333-6334/tcp"),
+# so a plain "NNNN->" match would miss the first port of every range.
+expand_host_ports() {
+  grep -oE '[0-9]+(-[0-9]+)?->' | sed 's/->//' | awk -F- '{ if (NF == 2) { for (i = $1; i <= $2; i++) print i } else print $1 }'
+}
+
 # Human-readable owner of a port: a Docker container, or a local process.
 port_owner() {
-  local p="$1" name
-  name=$(docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null | grep -E "[:.]$p->" | head -n1 | cut -d'|' -f1)
+  local p="$1" name="" listing cname cports
+  listing=$(docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null)
+  while IFS='|' read -r cname cports; do
+    [ -z "$cname" ] && continue
+    if printf '%s\n' "$cports" | expand_host_ports | grep -qx "$p"; then name="$cname"; break; fi
+  done <<< "$listing"
   if [ -n "$name" ]; then echo "docker container '$name'"; return; fi
   if command -v lsof >/dev/null 2>&1; then
     name=$(lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1" (pid "$2")"}')
@@ -77,8 +88,13 @@ OUR_PORTS=" "
 collect_our_ports() {
   local line
   line=$(docker ps --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Ports}}' 2>/dev/null \
-    | grep -oE '[0-9]+->' | tr -d '>-' | sort -u | tr '\n' ' ')
+    | expand_host_ports | sort -un | tr '\n' ' ')
   OUR_PORTS=" $line"
+}
+
+# The host port this compose service currently publishes for a container port, if running.
+current_port() {
+  docker compose port "$1" "$2" 2>/dev/null | awk -F: 'NF { print $NF; exit }'
 }
 
 CHOSEN=" "   # ports already assigned in this run
@@ -108,7 +124,8 @@ OLDIFS="$IFS"; IFS='
 '
 for row in $SERVICES; do
   IFS="$OLDIFS"
-  svc=${row%%|*}; rest=${row#*|}; var=${rest%%|*}; default=${rest#*|}
+  svc=${row%%|*}; rest=${row#*|}; var=${rest%%|*}; rest=${rest#*|}
+  default=${rest%%|*}; rest=${rest#*|}; csvc=${rest%%|*}; cport=${rest#*|}
   # precedence: real environment, then .env, then the default
   eval "wanted=\${$var:-}"
   [ -z "$wanted" ] && wanted=$(env_file_value "$var")
@@ -118,15 +135,26 @@ for row in $SERVICES; do
   case "$OUR_PORTS" in
     *" $wanted "*) status="in use by this stack (will be reused)"; chosen=$wanted ;;
     *)
-      if port_in_use "$wanted"; then
-        owner=$(port_owner "$wanted")
+      # Busy on the machine, or already handed to an earlier service as its fallback.
+      taken=0
+      case "$CHOSEN" in *" $wanted "*) taken=1 ;; esac
+      if [ "$taken" = 1 ] || port_in_use "$wanted"; then
+        if [ "$taken" = 1 ]; then owner="assigned to another service in this run"; else owner=$(port_owner "$wanted"); fi
         if [ "$STRICT" = 1 ]; then
           printf '  %-12s %-18s %-8s ' "$svc" "$var" "$wanted"; red "BUSY - $owner"
           CONFLICTS=$((CONFLICTS + 1)); chosen=$wanted; status=""
         else
-          chosen=$(next_free_port "$wanted")
-          if [ "$chosen" = 0 ]; then red "No free port found near $wanted for $svc."; exit 1; fi
-          status="busy ($owner) -> using $chosen instead"
+          # A restart should not shuffle ports: keep the one this service already uses.
+          current=$(current_port "$csvc" "$cport")
+          case "$CHOSEN" in *" $current "*) current="" ;; esac
+          if [ -n "$current" ]; then
+            chosen=$current
+            status="busy ($owner) -> keeping this stack's current port $chosen"
+          else
+            chosen=$(next_free_port "$wanted")
+            if [ "$chosen" = 0 ]; then red "No free port found near $wanted for $svc."; exit 1; fi
+            status="busy ($owner) -> using $chosen instead"
+          fi
         fi
       else
         status="free"; chosen=$wanted
@@ -174,6 +202,18 @@ if [ "$DEV_AUTH" = 1 ]; then
 elif grep -qE '^AUTH_MODE=okta' .env 2>/dev/null && grep -q 'YOUR-ORG' .env 2>/dev/null; then
   yellow "WARNING: .env still has the placeholder OKTA_ISSUER. The API refuses to start without a real"
   yellow "         issuer. Set OKTA_ISSUER, or run:  ./scripts/docker-up.sh --dev-auth"
+fi
+
+# Uploading works without a model key, but asking questions does not.
+have_llm_key=0
+for key in GROQ_API_KEY OPENAI_API_KEY GEMINI_API_KEY ANTHROPIC_API_KEY COHERE_API_KEY MISTRAL_API_KEY; do
+  eval "from_env=\${$key:-}"
+  [ -n "$from_env" ] || from_env=$(env_file_value "$key")
+  [ -n "$from_env" ] && have_llm_key=1
+done
+if [ "$have_llm_key" = 0 ]; then
+  yellow "NOTE: no LLM API key is set (e.g. GROQ_API_KEY in .env). You can upload documents, but"
+  yellow "      questions will fail with a 503 until you add one and restart the API."
 fi
 
 # ── start ────────────────────────────────────────────────────────────────────

@@ -56,10 +56,12 @@ services:
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379/0
       AUDIT_LOG_PATH: /var/log/rag/audit.jsonl
+      RAW_STORE_DIR: /var/lib/rag/raw          # original uploads, content-addressed, per tenant
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
       - audit_logs:/var/log/rag
+      - raw_store:/var/lib/rag/raw
       - hf_cache:/home/app/.cache/huggingface
       # Edit tenant policies without rebuilding the image; restart `api` to reload.
       - ./config:/app/config:ro
@@ -107,4 +109,5 @@ services:
 volumes:
   qdrant_storage:
   audit_logs:
+  raw_store:
   hf_cache:

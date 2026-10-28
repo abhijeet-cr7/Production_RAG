@@ -526,6 +526,22 @@ class TestQueryEndpoint:
         event = audit_events(api.audit)[-1]
         assert (event["action"], event["decision"], event["reason"]) == ("query", "error", "RuntimeError")
 
+    def test_no_llm_provider_is_a_503_that_says_what_to_do_not_a_bare_500(self, api):
+        error = RuntimeError("All configured LLM providers failed.")
+        client = TestClient(api.gateway.app, raise_server_exceptions=False)
+        with patch.object(api.gateway, "_answer_query", side_effect=error):
+            response = client.post("/query", json={"query": "q"}, headers=bearer())
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert "API key" in detail and ".env" in detail and "restart" in detail
+        event = audit_events(api.audit)[-1]
+        assert (event["action"], event["decision"], event["reason"]) == ("query", "error", "RuntimeError")
+
+    def test_other_runtime_errors_are_still_server_errors(self, api):
+        client = TestClient(api.gateway.app, raise_server_exceptions=False)
+        with patch.object(api.gateway, "_answer_query", side_effect=RuntimeError("something else broke")):
+            assert client.post("/query", json={"query": "q"}, headers=bearer()).status_code == 500
+
     def test_audit_failure_fails_closed_with_503(self, api):
         from online_pipeline.audit.logger import AuditError, set_audit
 

@@ -1060,6 +1060,15 @@ async def query(
             request_id=request_id,
             query_fp=query_fp,
         )
+        if isinstance(exc, RuntimeError) and "LLM providers failed" in str(exc):
+            # Not a bug: no provider is configured, or every one is down. Say so, instead of a bare 500.
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "No language-model provider is available. Add an API key for one "
+                    "(for example GROQ_API_KEY in .env), restart the API, and try again."
+                ),
+            ) from exc
         raise
     record("query", actor=principal, request_id=request_id, query_fp=query_fp, **audit_details)
     return response
