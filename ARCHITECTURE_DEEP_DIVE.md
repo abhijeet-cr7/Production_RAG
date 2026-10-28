@@ -1,105 +1,137 @@
 # Production RAG — Architecture Deep Dive
 
-A complete, chronological walkthrough of every code file, what it does, how data flows through it, and **why** each architectural decision exists.
+A walkthrough of every part of the system, how data flows through it, and **why** each decision exists. The system answers questions about financial documents (filings, earnings releases, XBRL data) for several tenants that must never see each other's data, with every answer checked before it is shown.
 
 ---
 
 ## What Changed Recently
 
-Read this first if you are coming back to the project. Newest first.
+Read this first if you are coming back to the project. Everything below is on branch `feat/access-control`, built in phases that each ended with a green test run. Several phases were also *mutation-checked*: a protection was deliberately broken to confirm a test fails (the surviving case is listed under [Known limitations](#known-limitations)).
 
-### Generation grading — hallucination and usefulness check *(branch `feat/generation-grading`)*
-
-Ported from the LangGraph Agentic-RAG repo (hallucination grader + answer grader), adapted to this pipeline:
-
-| Idea in the LangGraph repo | Applied here? | How / why not |
+| Phase | What it adds | Where |
 |---|---|---|
-| Hallucination grader (is the answer grounded in the docs?) | **Yes** | `online_pipeline/grading/grader.py`, called after every draft. |
-| Answer grader (does the answer address the question?) | **Yes** | Same single LLM call as above (one JSON verdict with two booleans), halving grading latency and cost. |
-| Retry generation when not grounded | **Yes, bounded** | One stricter regeneration (`max_generation_attempts`, default 2). The LangGraph version loops with no cap. |
-| "Not useful" → web search | **Yes** | If the answer is unhelpful or still ungrounded and web search has not run yet, fetch Tavily results, rerank with local chunks, regenerate once. |
-| Per-document LLM relevance grading | **No (deliberately)** | The cross-encoder reranker already scores every candidate; one LLM call per chunk adds cost and latency for little gain. The reranker score drives the pre-generation web-search gate instead. |
-| Question router (vectorstore vs web) | **No** | The corpus is user-uploaded and open-ended, so there is no fixed topic list to route on. Web search is a fallback, not a first choice. |
-| Web search fallback | **Already existed** | `TavilyWebSearch` (see Step 6b); grading adds a second, post-generation trigger. |
+| **Grading** | A grader checks each answer is grounded and useful; one bounded retry; web top-up | `online_pipeline/grading/` |
+| **P0 Auth** | Okta (OIDC/JWT) login, scopes, per-tenant policy ceiling, fail-closed startup | `online_pipeline/auth/` |
+| **P1 Audit** | Tamper-evident, hash-chained log of who did what | `online_pipeline/audit/` |
+| **P2 ACLs** | Every chunk carries tenant/owner/groups/classification; ids can't collide across tenants | `online_pipeline/auth/acl.py` |
+| **P3 Entitled retrieval** | The caller's access rule is applied inside the vector store *and* re-checked in Python; BM25 is per tenant | `retrieval/`, `vector_db/` |
+| **P4 Safe ingestion** | SSRF-proof fetching, hidden-text stripping, injection quarantine, parsing in a sandbox subprocess | `offline_pipeline/safety/` |
+| **P5 Provenance** | Server-computed trust tier, content hash, raw-original store, supersession | `online_pipeline/provenance/` |
+| **P6 Tables & XBRL** | Tables kept whole; inline XBRL facts parsed exactly; table-aware chunking | `offline_pipeline/tables/` |
+| **P7 Answer safety** | Citation + figure verification, output sanitising, advice refusal, per-tenant policies | `online_pipeline/answer_safety/` |
+| **P8 Lifecycle** | List/patch/delete documents, legal hold, retention purge, legacy backfill, audit read | `online_pipeline/lifecycle.py` |
+| **Docker** | One-command stack with a port check; UI behind nginx | `docker-compose.yml`, `scripts/docker-up.sh` |
 
-Additional hardening that the LangGraph repo does not have:
+The earlier LangGraph "agentic RAG" ideas were applied like this: hallucination grading and answer grading **yes** (one combined call, bounded), web search fallback **already existed** (now also triggered after grading and limited to verified publishers when a tenant requires it), per-document LLM relevance grading **no** (the cross-encoder reranker already scores every chunk), question router **no** (the corpus is open-ended).
 
-- **Fail-open**: if every grader provider errors, the answer is returned ungraded (`grounded: null`) instead of failing the request.
-- **Unparseable grader output** (code fences, prose, `"false"` as a string) is handled by tolerant parsing; incomplete verdicts raise and fall through to the next provider.
-- **Ungrounded policy** (`ungrounded_answer_policy`): after the retries are spent, `warn` prepends a caveat, `abstain` replaces the answer with a refusal.
-- **Observability**: `grade_generation` is a traced stage in LangSmith.
-- The `/query` response gains `grounded`, `answer_useful` and `generation_attempts`.
-
-New settings: `answer_grading_enabled`, `grader_provider`, `grader_model`, `max_generation_attempts`, `ungrounded_answer_policy`.
-
-### Earlier changes now reflected in this document
-
-- **Web search fallback** (Tavily) with a weak-local-recall gate, and **LangSmith tracing** of every stage.
-- **`POST /ingest/url`** and **`POST /ingest/api`** now use `WebExtractor` / `APIExtractor` (previously CLI-only).
-- Groq default model changed from the decommissioned `llama-3.1-8b-instant` to `openai/gpt-oss-20b`.
+A bug review of an earlier branch (`fix/rag-pipeline-defects`) was merged in: the embedding model is loaded once instead of per call, RRF fusion no longer collapses a document's chunks into one, the Kafka worker no longer overwrites a document with itself, BM25 actually runs, and `/query` no longer blocks the event loop.
 
 ---
 
 ## Table of Contents
 
 1. [The Big Picture](#the-big-picture)
-2. [Shared Foundation](#shared-foundation)
-3. [Offline Pipeline — Ingestion](#offline-pipeline--ingestion)
-   - [Step 1 — Extraction](#step-1--extraction)
-   - [Step 2 — Text Cleaning](#step-2--text-cleaning)
-   - [Step 3 — Metadata Enrichment](#step-3--metadata-enrichment)
-   - [Step 4 — Chunking Strategy Router](#step-4--chunking-strategy-router)
-   - [Step 5 — Kafka (Optional Async Path)](#step-5--kafka-optional-async-path)
-   - [Step 6 — Embedding Worker](#step-6--embedding-worker)
-   - [Step 7 — Vector DB Upsert](#step-7--vector-db-upsert)
-4. [Online Pipeline — Query & Answer](#online-pipeline--query--answer)
-   - [Step 1 — HTTP Request hits the Gateway](#step-1--http-request-hits-the-gateway)
-   - [Step 2 — LLM Router selects a provider](#step-2--llm-router-selects-a-provider)
-   - [Step 3 — Query Rewriting](#step-3--query-rewriting)
-   - [Step 4 — Embedding Cache + Embed](#step-4--embedding-cache--embed)
-   - [Step 5 — Hybrid Retrieval](#step-5--hybrid-retrieval)
-   - [Step 6 — Reranking](#step-6--reranking)
-   - [Step 6b — Web Search Fallback](#step-6b--web-search-fallback)
-   - [Step 7 — Context Building](#step-7--context-building)
-   - [Step 8 — LLM Answer Generation](#step-8--llm-answer-generation)
-   - [Step 9 — Generation Grading](#step-9--generation-grading)
-   - [Observability](#observability-langsmith)
-5. [Infrastructure Services](#infrastructure-services)
-6. [Why This Architecture?](#why-this-architecture)
+2. [Security model](#security-model)
+3. [Shared Foundation](#shared-foundation)
+4. [Offline Pipeline — Ingestion](#offline-pipeline--ingestion)
+5. [Online Pipeline — Query & Answer](#online-pipeline--query--answer)
+6. [Document management and lifecycle](#document-management-and-lifecycle)
+7. [Infrastructure Services](#infrastructure-services)
+8. [Operations runbook](#operations-runbook)
+9. [Known limitations](#known-limitations)
+10. [Testing and verification](#testing-and-verification)
+11. [Why This Architecture?](#why-this-architecture)
 
 ---
 
 ## The Big Picture
 
-This system has **two completely separate pipelines** that share infrastructure:
+Two pipelines share one store, and a thin security layer wraps both.
 
 ```
-┌───────────────────────────────────────────────────────────────┐
-│  OFFLINE PIPELINE  (writes to the knowledge base)             │
-│                                                               │
-│  Document/URL/API → Extract → Clean → Enrich → Chunk →        │
-│  [Kafka queue] → Embed → VectorDB.upsert()                    │
-└───────────────────────────────────────────────────────────────┘
+        Okta token ──► authenticate ──► scopes ──► tenant policy ceiling ──► audit event
+                          │
+┌─────────────────────────┴─────────────────────────────────────────────┐
+│ OFFLINE (write path)                                                  │
+│                                                                       │
+│ file / URL / API                                                      │
+│   → size cap + type check                                             │
+│   → SafeFetcher (SSRF-proof) ......... for URL/API                    │
+│   → sandboxed parser subprocess (PDF/DOCX/HTML/XBRL/TXT)              │
+│   → hidden-text strip → injection screen (quarantine)                 │
+│   → blocks (prose / tables / XBRL facts)                              │
+│   → table-aware chunker → embed → upsert with ACL + provenance        │
+└───────────────────────────────────────────────────────────────────────┘
 
-                        ┌─────────────┐
-                        │  Qdrant DB  │  ← shared store
-                        └─────────────┘
+                     ┌───────────────────────┐
+                     │ Qdrant (per-chunk ACL) │   raw originals: content-addressed store
+                     └───────────────────────┘
 
-┌───────────────────────────────────────────────────────────────┐
-│  ONLINE PIPELINE  (reads from the knowledge base to answer)   │
-│                                                               │
-│  HTTP /query → Rewrite → [Redis cache] → Embed →             │
-│  HybridRetrieve → Rerank → [Web top-up if weak] →             │
-│  BuildContext → LLM → Grade → [retry / web] → Answer          │
-└───────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│ ONLINE (read path)                                                    │
+│                                                                       │
+│ /query → advice refusal → rewrite → embed → ENTITLED retrieval        │
+│   (vector pre-filter + per-tenant BM25 + Python guard) → rerank       │
+│   → trust filter → [web top-up] → context → LLM (hardened prompt)     │
+│   → grade + verify figures → [retry / web] → policy (warn/abstain)    │
+│   → sanitise output → answer + sources + verification                 │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
-The **Offline Pipeline** is a *write path*: it transforms raw documents into searchable vectors stored in Qdrant.
-
-The **Online Pipeline** is a *read path*: it takes a user question, finds the most relevant chunks, and generates a grounded answer.
+The **offline pipeline** turns untrusted documents into searchable, access-controlled, provenance-stamped chunks. The **online pipeline** finds only what the caller may read, drafts an answer, and refuses to show figures it cannot trace to a cited source.
 
 ---
 
+## Security model
+
+### Who can do what
+
+A request carries an Okta **access token**. It is validated (RS256 only, issuer, audience, expiry; keys from Okta's JWKS) and turned into a `Principal`: user, **tenant**, groups, clearance (0–3) and scopes. A token with no tenant is refused; there is no default tenant.
+
+| Scope | Allows |
+|---|---|
+| `rag:query` | `POST /query` |
+| `rag:ingest` | uploads, `/ingest/url`, `/ingest/api`, manage *your own* documents |
+| `rag:web` | the web-search fallback |
+| `rag:admin` | quarantine review, legal hold, manage any document in your tenant |
+| `rag:audit` | `GET /audit` (your tenant's events only) |
+
+**Tenant policy is a ceiling.** `config/tenant_policies.yaml` sets, per tenant, whether web search or URL ingest is allowed at all, the URL allow-list, the highest classification, whether only verified sources may feed answers, and the warn/abstain rules. The effective permission is *tenant policy AND user scope AND request flag*; a request can only opt **out**. An unknown tenant gets the most restrictive policy.
+
+### Document access rule
+
+A chunk is readable iff **all** hold: same tenant · `classification ≤ caller's clearance` · (caller is the owner, or the chunk is public to the tenant, or they share a group) · not quarantined · not superseded. A chunk missing any ACL field is denied. This rule is implemented twice and the two must agree:
+
+1. as a Qdrant filter built **server-side** from the token (so top-k fills with allowed chunks), and
+2. as `is_authorized()` in Python, run on every candidate list after retrieval and again after any web top-up.
+
+Anything the second layer drops means the first was bypassed, so it is recorded as an `acl.guard_dropped` audit event. The caller can no longer send a filter: `QueryRequest` rejects unknown fields.
+
+### Threats and the control for each
+
+| Threat | Control | Code |
+|---|---|---|
+| Another tenant reads my documents | ACL pre-filter + guard + per-tenant BM25 + store re-check of BM25 hits | `auth/acl.py`, `retrieval/` |
+| Identical upload from another user overwrites my ACL | `doc_id` hashes tenant + owner + content | `auth/acl.py` |
+| Forged / expired / key-confusion token | RS256 pinned, `alg=none` rejected, issuer/audience/expiry required | `auth/tokens.py` |
+| SSRF via `/ingest/url` | https only, allow-list, every DNS answer must be public, connect to the validated IP, per-hop redirect checks | `safety/net.py` |
+| Huge or lying download | decoded-size cap, deadline, declared type must match the bytes | `safety/net.py` |
+| Malicious PDF (JavaScript, launch, embedded files, bombs) | object-graph inspection, bounded decompression, parsing in a limited subprocess | `safety/pdf_guard.py`, `sandbox.py` |
+| Malicious DOCX / XML (macros, remote templates, XXE, zip bombs) | part/relationship inspection, hardened XML parser, ratio limits | `safety/docx_guard.py`, `xml_guard.py` |
+| Hidden-text prompt injection | hidden elements/characters stripped, invisible Unicode removed, injection screen → quarantine | `safety/html_sanitizer.py`, `injection.py` |
+| Poisoned document steers the model | context and history wrapped in delimiters it cannot close; prompt says they are data | `llm/llm_client.py` |
+| Model leaks data through a link or image | output sanitiser removes images, HTML and URLs that are not the answer's own sources | `answer_safety/sanitize.py` |
+| Wrong or invented figure | every figure checked against cited sources: value, period, currency, sign | `answer_safety/verify.py` |
+| Unverifiable source feeds an answer | trust tier computed from the host; tenants can require verified sources | `provenance/trust.py` |
+| Someone alters the audit trail | HMAC hash chain; `scripts/verify_audit_chain.py` | `audit/logger.py` |
+| Secrets in the parser | parser runs with a scrubbed environment and no network credentials | `safety/sandbox.py` |
+| Confidential text leaves via tracing | LangSmith runs hide prompts and answers by default | `observability/tracing.py` |
+
+### Audit
+
+Every query, ingest, ACL change, delete, policy denial and auth failure becomes one event in an append-only JSONL file. Each event stores the previous event's hash and `hash = HMAC(key, previous_hash + body)`, so editing, removing or reordering an event breaks the chain and nobody without the key can forge one. Events hold **ids and keyed fingerprints, never document text, queries or answers**. With `AUDIT_FAIL_CLOSED=true` a request whose event cannot be written fails with 503.
+
+---
 ## Shared Foundation
 
 ### `config/settings.py` — The Single Source of Truth
@@ -129,122 +161,115 @@ settings = Settings()  # singleton at module level
 | Redis settings | Embedding cache TTL and URL |
 | Qdrant settings | Where vectors are stored |
 | `top_k_retrieval` / `top_k_rerank` | Pipeline funnel sizes |
-| `chunking_strategy` / `chunk_size` | How documents are split |
+| `chunking_strategy` / `chunk_size` | How documents are split (`auto`, `fixed_token`, `recursive`, `table_aware`) |
+| `app_env`, `auth_mode`, `okta_*` | Environment and Okta token validation (see [Security model](#security-model)) |
+| `tenant_policies_path` | The per-tenant policy file |
+| `audit_log_path`, `audit_hmac_key`, `audit_fail_closed` | The tamper-evident audit log |
+| `ingest_*`, `parser_*`, `pdf_*` | Upload/fetch size caps, rate limit, sandbox CPU/memory/time limits |
+| `verified_publishers`, `raw_store_*` | Which hosts count as verified; where originals are kept |
+| `require_citations`, `answer_verification_enabled` | Answer verification switches |
+| `retention_days` | Used by `scripts/purge_expired.py` |
 | `tavily_api_key`, `web_search_*` | Web fallback and its weak-recall thresholds |
-| `answer_grading_enabled`, `grader_*`, `max_generation_attempts`, `ungrounded_answer_policy` | Hallucination / usefulness grading loop |
+| `answer_grading_enabled`, `grader_*`, `max_generation_attempts` | Hallucination / usefulness grading loop (the warn/abstain rules are per tenant, in the policy file) |
 | `langsmith_*` | Tracing |
 
 ---
 
 ## Offline Pipeline — Ingestion
 
-The offline pipeline is triggered via `POST /ingest` on the API gateway. In a scaled deployment, it can also be run fully asynchronously through Kafka. Here is the complete step-by-step flow:
+Documents arrive three ways: `POST /ingest` (upload one or more PDF, DOCX, TXT, HTML or XBRL files), `POST /ingest/url`, and `POST /ingest/api`. All three share one rule: **the input is hostile until proven otherwise**, and all three end in the same indexing step.
 
 ```
-UploadedFile (PDF/DOCX/TXT)
-        │
-        ▼
-  DocumentExtractor.extract()          ← offline_pipeline/extractors/document_extractor.py
-        │ {"text": str, "metadata": {source, file_type, page_count}}
-        ▼
-  TextCleaner.clean()                  ← offline_pipeline/preprocessors/cleaner.py
-        │ normalised text
-        ▼
-  MetadataEnricher.enrich()           ← offline_pipeline/preprocessors/metadata_enricher.py
-        │ metadata += {doc_id, char_count, word_count, ingested_at}
-        ▼
-  ChunkingStrategyRouter.chunk()       ← offline_pipeline/chunkers/router.py
-        │   ┌── TextChunker (fixed_token)        ← chunkers/text_chunker.py
-        │   └── RecursiveTextChunker (recursive) ← chunkers/recursive_chunker.py
-        │ list of {text, metadata{chunk_index, token_count, chunking_strategy}}
-        ▼
-  [Optional: ChunkProducer → Kafka → ChunkConsumer → EmbeddingWorker]
-        │                            ← kafka/producer.py, consumer.py, embedding_workers/worker.py
-        ▼
-  embed_text(chunk.text)              ← online_pipeline/cache/embedding_cache.py
-        │ list[float] (384-dim default)
-        ▼
-  VectorDBClient.upsert()             ← vector_db/client.py
-        │ point = {id: uuid5, vector, payload: metadata, text}
-        ▼
-      Qdrant
+upload ──► size cap (streamed) ─► type must match bytes ─┐
+URL/API ─► SafeFetcher ──────────────────────────────────┤
+                                                          ▼
+                       sandbox subprocess: inspect + parse (PDF/DOCX/HTML/XBRL/TXT)
+                                                          │  text + blocks (prose, tables, XBRL facts)
+                                                          ▼
+                       clean (invisible Unicode) → injection screen ──► quarantine if flagged
+                                                          │
+                                                          ▼
+                       enrich (tenant+owner scoped doc_id) → stamp ACL + provenance
+                                                          │
+                                                          ▼
+                       chunk (table-aware when tables/facts exist) → embed (batched) → upsert
 ```
+
+Before anything runs, the request's ACL is validated: tenant and owner come from the token only, a caller can share only with groups they belong to, and cannot classify above their own clearance or the tenant's ceiling. A bad ACL rejects the whole request.
 
 ---
 
-### Step 1 — Extraction
+### Step 1 — Safe extraction
 
-**File:** `offline_pipeline/extractors/document_extractor.py`  
-**Class:** `DocumentExtractor`
+**Files:** `offline_pipeline/safety/` (`net.py`, `sandbox.py`, `extract_worker.py`, `pdf_guard.py`, `docx_guard.py`, `markup_guard.py`, `xml_guard.py`, `upload_guard.py`, `html_sanitizer.py`)
 
-This is the entry point for all document ingestion. It reads a file from disk and turns it into a Python dict with `text` and `metadata`.
+**Fetching (`SafeFetcher`).** URL and API ingests are checked *before* a connection opens and again on every redirect:
 
 ```
-file_path (.pdf / .docx / .txt)
-        │
-        ├── .pdf  → pypdf.PdfReader → extract_text() per page
-        │             └── blank page? → Tesseract OCR fallback (_ocr_page)
-        ├── .docx → python-docx Document → join all paragraph.text
-        └── .txt  → Path.read_text(encoding="utf-8")
-        │
-        ▼
-{"text": "full document text...", "metadata": {"source": path, "file_type": "pdf", "page_count": N}}
+https only · no credentials in the URL · port 443 · host on the tenant allow-list
+   → resolve DNS → EVERY address must be globally routable
+        (no loopback, private, link-local/cloud-metadata, CGNAT, multicast, IPv4-mapped, 6to4, NAT64)
+   → connect to the validated IP (TLS still verifies the real host name)   ← defeats DNS rebinding
+   → follow at most 3 redirects, each re-validated
+   → stream the body; stop at the byte cap on the DECODED size (gzip bombs)
+   → declared Content-Type must be allow-listed AND match what the bytes are
 ```
 
-**Why Tesseract OCR fallback?**  
-Many PDFs (scanned documents, report exports) have image-based pages where `pypdf` extracts nothing. The fallback renders the page as an image and runs OCR to recover the text. Without this, scanned documents would silently produce empty chunks.
+**Parsing (the sandbox).** Every file and every downloaded page is parsed by `extract_worker.py` in a **separate process** that limits itself first (CPU seconds, memory, file size, no core dumps), runs with a **scrubbed environment** (no API keys), and prints one JSON line. The parent kills it on timeout or if its memory grows past the limit. A parser exploit, a hang or a bomb can cost one disposable process, never the API.
 
-**Other extractors, exposed through their own routes:**
-- `web_extractor.py` — `WebExtractor` (`POST /ingest/url`): uses `requests` + `BeautifulSoup` to scrape a URL. Strips nav/footer/script/style tags to get clean body text.
-- `api_extractor.py` — `APIExtractor` (`POST /ingest/api`): uses `httpx` to hit a JSON REST endpoint. Can optionally pick only specific fields from the JSON response.
+**Inspecting before extracting:**
 
-All three routes converge on the same `_index_document()` helper (clean → enrich → chunk → embed → upsert).
+| Format | Rejected when |
+|---|---|
+| PDF | encrypted · too many pages · JavaScript, launch/submit/import actions, embedded files, rich media, XFA, automatic actions (found by walking the object graph, including objects packed in object streams and nested dictionaries) · a stream that expands past its ceiling or an image with absurd dimensions (measured with a *bounded* decompressor, so a bomb is refused in milliseconds) |
+| DOCX | macros, embedded OLE/ActiveX, remote templates or frames · path traversal · too many parts · suspicious compression ratio · any XML part with a DTD or entities (XXE, billion laughs) |
+| HTML | sanitised, not rejected: scripts, frames, forms, comments removed, and **hidden elements** (inline-style hiding, `hidden`, `aria-hidden`, off-screen, zero-size, white-on-white, "visually hidden" classes) dropped |
+| XML / XBRL | any DTD or entity declaration · wrong root |
+| Any | size cap exceeded while streaming · bytes do not match the extension |
+
+PDF text also drops characters a human could not see (1pt, off-page, white on white unless over a dark box) and counts them; a hit is a signal, not a rejection.
+
+Files are accepted only as `.pdf .docx .txt .html .htm .xml .xbrl`. The name shown as the source is the sanitised file name; a server temp path never appears.
 
 ---
 
-### Step 2 — Text Cleaning
+### Step 2 — Text cleaning and the injection screen
 
-**File:** `offline_pipeline/preprocessors/cleaner.py`  
-**Class:** `TextCleaner`
+**Files:** `offline_pipeline/preprocessors/cleaner.py`, `offline_pipeline/safety/injection.py`
 
-Raw extracted text is messy. This step normalises it in three passes before any other processing touches it.
+The cleaner does three things: NFKC Unicode normalisation, removal of **invisible characters** (zero-width, bidi overrides, soft hyphen and the Unicode "tag" block that can smuggle readable ASCII past a reviewer), and whitespace collapse. Table cells are cleaned cell by cell so column structure survives.
 
-```
-raw text
-    │
-    ├── NFKC Unicode normalisation   → "ﬁle" becomes "file", "½" stays "½"
-    ├── Control char removal         → strips \x00–\x1f EXCEPT \n and \t
-    └── Whitespace collapse          → 3+ blank lines → 2 blank lines
-                                     → multiple spaces on one line → single space
-    │
-    ▼
-clean, normalised text
-```
+Then the **injection screen** looks for text aimed at the model rather than the reader ("ignore all previous instructions", role markers like `<|im_start|>`, tool-call syntax, "send the conversation to https://…", markdown images that carry data out). Findings have a severity:
 
-**Why NFKC specifically?**  
-Many PDF extractors produce ligature characters (`ﬁ`, `ﬂ`), compatibility forms of digits or punctuation, and full-width characters. NFKC decomposes these into their canonical ASCII equivalents. Without it, token counts are inflated and BM25 keyword matches fail because `ﬁle` ≠ `file`.
+- **high** → the whole document is stored but **quarantined**: invisible to every retrieval until a tenant admin releases it (`POST /admin/quarantine/{doc_id}/release`);
+- medium/low (a `System:` line, a long encoded blob, hidden content that was removed) → recorded in `screen_flags` only.
 
-**Why preserve `\n` and `\t`?**  
-These carry structural meaning (paragraph breaks, table alignment). Stripping them would destroy the signals used by the `RecursiveTextChunker` to find natural split boundaries.
+It is a heuristic: it catches blunt attacks, and the prompt delimiters and output sanitiser exist for the ones it misses. A test corpus of ordinary financial sentences guards against false positives.
 
 ---
 
-### Step 3 — Metadata Enrichment
+### Step 3 — Metadata enrichment
 
 **File:** `offline_pipeline/preprocessors/metadata_enricher.py`
-**Class:** `MetadataEnricher`
-
-After cleaning, the doc dict goes through `enrich()` which derives four extra metadata fields and attaches them.
 
 ```python
-metadata["doc_id"]      = hashlib.sha256(text.encode()).hexdigest()
+metadata["doc_id"]      = sha256(len-prefixed tenant_id + owner_id + text)
 metadata["char_count"]  = len(text)
 metadata["word_count"]  = len(text.split())
 metadata["ingested_at"] = datetime.now(tz=timezone.utc).isoformat()
 ```
 
-**Why SHA-256 as the doc ID?**  
-The hash is deterministic: the same document always gets the same ID. This enables **idempotent re-ingestion** — if you re-ingest a document, the Qdrant point IDs (derived from `doc_id + chunk_index`) will be the same, and `upsert` will overwrite rather than duplicate. It also uniquely identifies a document without needing an external database sequence.
+**Why include tenant and owner in the hash?** A hash of the content alone gave two tenants who uploaded the same file the *same* point ids, so the second upload silently overwrote the first one's access rules. Hashing tenant and owner too means identical files stay separate, while the same owner re-uploading the same file still updates in place (idempotent). Length-prefixing stops `("ab","c")` and `("a","bc")` colliding.
+
+Every chunk is then stamped by the gateway (never by a client, extractor or chunker):
+
+| Group | Fields |
+|---|---|
+| ACL | `tenant_id` `owner_id` `acl_groups` `acl_public` `classification` |
+| Provenance | `source_type` `origin` `content_sha256` `trust_tier` `publisher` `ingested_by` `fetched_at` `external_id` `as_of` `integrity_verified` `supersedes` |
+| State | `quarantined` `superseded` `screen_flags` |
+
+**Provenance is computed on the server.** `trust_tier` is `verified_primary` only for https content from a publisher on the server-side list (default `sec.gov`), `internal` for an authenticated upload, `unverified` for any other host. A client may declare only `as_of`, `expected_sha256` (a mismatch rejects the document) and `supersedes`. For SEC URLs the accession number is parsed into `external_id`. The exact original bytes are kept in a content-addressed, per-tenant store under their hash (`provenance/rawstore.py`), so a figure can be traced to the file it came from.
 
 ---
 
@@ -256,12 +281,14 @@ The hash is deterministic: the same document always gets the same ID. This enabl
 LLMs have a fixed context window, so long documents must be split into chunks. The router decides *how* to split based on the document's structure.
 
 ```
-ChunkingStrategyRouter.chunk(text, metadata)
+ChunkingStrategyRouter.chunk(text, metadata, blocks=None)
         │
         ├── strategy="fixed_token"  → TextChunker
         ├── strategy="recursive"    → RecursiveTextChunker
+        ├── strategy="table_aware"  → BlockChunker (needs blocks; else falls back to recursive)
         └── strategy="auto" (default)
               │
+              ├── blocks contain a table or XBRL facts?   → table_aware
               ├── file_type in {md, markdown, html, web}? → recursive
               ├── text contains "\n\n" or "#" headers?   → recursive
               └── otherwise                              → fixed_token
@@ -302,6 +329,20 @@ Each piece is recursively split further if it still exceeds `chunk_size`. Pieces
 
 **Why two chunkers?**  
 Flat unstructured text (e.g., a raw transcript) has no meaningful boundaries to split on — fixed_token gives you predictable uniform chunks. Structured prose (a Wikipedia article, markdown docs, a web page) has explicit paragraph and section structure — splitting at those boundaries keeps semantically coherent units together, improving retrieval precision.
+
+#### `TableChunker` and `BlockChunker` — `offline_pipeline/tables/`, `offline_pipeline/chunkers/block_chunker.py`
+
+When a document actually contains tables or XBRL facts, `auto` selects **`table_aware`** chunking; any other document chunks exactly as before (a test pins this byte-for-byte). Extractors no longer return one flat string: they return ordered **blocks** (headings, prose, tables, fact groups), because flattening destroys tables.
+
+```
+HTML:  <table> → grid (colspan/rowspan expanded, header rows, caption and "(In millions)" from the line above)
+PDF:   ruled tables via pdfplumber · borderless numeric statements via our own detector
+       (label then numbers only, right edges lining up into columns; digit-heavy prose fails both tests)
+DOCX:  w:tbl in document order; merged cells appear once; headings from styles
+XBRL:  ix:nonFraction → exact value × 10^scale, sign, unit, period, dimensions; hidden free text ignored
+```
+
+`TableChunker` rules: **never split a row**; every chunk repeats the caption, the units line and the column headers; an over-wide row is split by column group with its row label kept in each part; footnotes stay attached. Each chunk has two forms: the *embedded text* is linearised (`Net sales: FY2024 = 391,035; FY2023 = 383,285`), which matches queries far better than pipes, and the payload keeps the original Markdown plus `numerics`, the parsed cells with exact values (`(1,234)` → −1234, scale applied once, percentages never scaled). Fact chunks carry the same `numerics` from XBRL. Those structured numbers are what answer verification checks against.
 
 ---
 
@@ -355,98 +396,84 @@ Most embedding APIs (OpenAI, Cohere) and `SentenceTransformer.encode()` are sign
 
 ### Step 7 — Vector DB Upsert
 
-**File:** `vector_db/client.py`  
+**File:** `vector_db/client.py`
 **Class:** `VectorDBClient`
 
-The final step of ingestion — writing the vector and its associated payload into Qdrant.
-
 ```python
-# In /ingest route (sync path)
-point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{doc_id}_{chunk_index}"))
-
-_vector_db.upsert([{
-    "id": point_id,
-    "vector": embed_text(chunk["text"]),   # 384-dim float list
-    "payload": chunk["metadata"],          # all metadata fields
-    "text": chunk["text"],                 # stored inside payload
-}])
+point_id = uuid5(NAMESPACE_URL, f"{doc_id}_{chunk_index}")      # doc_id is tenant+owner scoped
+upsert([{"id": point_id, "vector": ..., "payload": acl + provenance + state + chunk metadata, "text": ...}])
 ```
 
-`ensure_collection()` is called at startup and creates the Qdrant collection with **cosine distance** if it does not already exist.
+`ensure_collection()` runs at startup: it creates the collection (cosine distance) and **payload indexes** on every field a filter touches (`tenant_id`, `owner_id`, `acl_groups`, `classification`, `acl_public`, `quarantined`, `superseded`, `doc_id`, `source`, `content_sha256`). It is idempotent, so it upgrades existing collections.
 
-**Why cosine distance?**  
-Sentence-transformer vectors and OpenAI embeddings are L2-normalised, meaning their dot product equals their cosine similarity. Cosine distance ignores vector magnitude and measures the angle between vectors, making it robust to varying text lengths.
+`collection_for_tenant(tenant_id)` is the single place that decides which collection holds a tenant's data. Today it returns one shared collection, isolated by the tenant filter; returning a per-tenant name (and provisioning it) is the whole change needed for collection-per-tenant isolation.
 
-**Why UUID5 from `doc_id + chunk_index`?**  
-UUID5 is deterministic (same inputs → same UUID). Re-ingesting the same document produces the same point IDs, so Qdrant performs an update rather than creating duplicates.
+`search()` **requires a principal** and builds the entitlement filter itself; there is no way to run an unfiltered search. The Kafka worker refuses any chunk that has no ACL fields.
 
 ---
 
 ## Online Pipeline — Query & Answer
 
-This pipeline is triggered by `POST /query`. Every component is initialised once at startup inside the `lifespan` context manager and reused across all requests.
+Triggered by `POST /query`. Components are created once in `lifespan`. The whole synchronous pipeline runs in a worker thread so concurrent queries overlap.
 
 ```
-POST /query {"query": "...", "top_k": 5}
+POST /query {"query": "...", "top_k": 5, "source_in": [...]?, "web_search": bool?}
+        │
+        ▼  authenticate · scope rag:query · tenant policy
+  1. investment-advice request?  ──► declined (no retrieval, no model call)
+  2. rewrite → embed (Redis cache)
+  3. ENTITLED retrieval: vector pre-filter + per-tenant BM25 (re-checked in the store) → RRF
+  4. guard: ACL re-check + trust filter  ──► audit anomaly if the pre-filter was bypassed
+  5. rerank (cross-encoder)
+  6. weak recall? → web search (tenant ceiling ∧ rag:web ∧ not opted out; verified publishers only if required)
+  7. context = the chunks that fit the budget; [n] is position n
+  8. generate (hardened prompt)
+  9. evaluate: LLM grade (grounded? useful?) + deterministic verification (citations, figures)
+        └─ failing → regenerate with specific feedback (bounded) → web top-up once → re-evaluate
+ 10. policy: warn or abstain, per tenant      11. sanitise output      12. disclaimer
         │
         ▼
-  gateway.py: query()
-        │
-        ├── 1. LLMRouter.rewrite_query(query)       ← LLM query rewrite
-        ├── 2. EmbeddingCache.get(rewritten)         ← Redis cache check
-        │       └── miss → embed_text(rewritten)     ← compute + cache
-        ├── 3. HybridRetriever.retrieve(...)         ← BM25 + Vector → RRF fusion
-        ├── 4. Reranker.rerank(...)                  ← cross-encoder scoring
-        ├── 4b. weak local recall? → TavilyWebSearch → rerank local + web together
-        ├── 5. ContextBuilder.build(reranked)        ← format chunks for LLM
-        ├── 6. LLMRouter.generate_answer(...)        ← draft answer
-        └── 7. LLMRouter.grade_answer(...)           ← grounded? useful?
-                ├── not grounded → regenerate with feedback (bounded)
-                ├── not useful / still ungrounded, no web yet → web top-up → regenerate
-                └── still not grounded → warn or abstain (policy)
-        │
-        ▼
-{"answer": "...", "sources": [...], "web_search_used": bool,
- "grounded": bool|null, "answer_useful": bool|null, "generation_attempts": int}
+{"answer", "sources" (public fields only), "web_search_used", "grounded", "answer_useful",
+ "generation_attempts", "trust_summary", "warnings", "verification", "needs_review"}
 ```
 
 ---
 
 ### Step 1 — HTTP Request hits the Gateway
 
-**File:** `online_pipeline/api/gateway.py`  
+**File:** `online_pipeline/api/gateway.py`
 **Framework:** FastAPI
 
-The gateway is the only public-facing entry point. At startup, the `lifespan` context manager initialises all singletons exactly once:
+At startup `lifespan` validates the configuration and **refuses to start** if it is unsafe (`AUTH_MODE=disabled` or `dev_token` outside `APP_ENV=dev`, an `http://` Okta issuer, no audit key or Qdrant key in production, a dev secret under 32 characters). It then loads the tenant policies, writes a `service.start` audit event (so a broken audit log stops the service at boot), and creates the singletons.
 
-```python
-@asynccontextmanager
-async def lifespan(app):
-    configure_tracing()                        # LangSmith, no-op if off
-    _vector_db      = VectorDBClient()         # connects to Qdrant
-    _vector_db.ensure_collection()             # creates collection if absent
-    _llm_router     = LLMRouter()              # reads routing config
-    _cache          = EmbeddingCache(...)      # connects to Redis
-    _retriever      = HybridRetriever(...)     # sets up BM25 + vector
-    _reranker       = Reranker()               # loads cross-encoder model
-    _context_builder = ContextBuilder()
-    _web_search     = TavilyWebSearch()        # disabled if no API key
-    yield
-    # cleanup would go here
-```
+Every route except `/health` depends on `require_scope(...)`: it validates the token, checks the scope, and records `auth.fail` / `authz.fail` events (token text is never logged).
 
-**Why lifespan and not module-level globals?**  
-`lifespan` runs after the event loop starts. This ensures async-unfriendly startup work (model loading, network connections) happens in the right context and only once, not on every import.
-
-**Request model validation:**
 ```python
 class QueryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")   # a caller cannot send a filter of their own
     query: str
-    metadata_filter: dict | None = None   # passed to Qdrant for filtered search
-    top_k: int = settings.top_k_rerank    # default 5
-    chat_history: list[dict] = []         # multi-turn conversation support
-    web_search: bool | None = None        # None = follow settings.web_search_enabled
+    source_in: list[str] | None = None          # narrows within what you may read, never widens
+    top_k: int = settings.top_k_rerank
+    chat_history: list[dict] = []
+    web_search: bool | None = None              # can only opt OUT of web search
 ```
+
+**Endpoints**
+
+| Method & path | Scope | Purpose |
+|---|---|---|
+| `GET /health` | none | liveness, and whether lexical retrieval is live |
+| `POST /query` | `rag:query` | the pipeline above |
+| `POST /ingest` | `rag:ingest` | upload files (optional `acl_groups`, `acl_public`, `classification`, `as_of`, `expected_sha256`, `supersedes`) |
+| `POST /ingest/url` · `/ingest/api` | `rag:ingest` | fetch through `SafeFetcher`; also need the tenant's `allow_url_ingest` and allow-list |
+| `GET /documents` | `rag:ingest` | your documents with status (`?all=true` needs `rag:admin`) |
+| `PATCH /documents/{id}/acl` | `rag:ingest` (owner) / admin | change who can read it; effective on the next query |
+| `DELETE /documents/{id}` | owner / admin | delete chunks and the original (unless another document uses the bytes); blocked by legal hold |
+| `POST /admin/documents/{id}/legal-hold` | `rag:admin` | place or lift a hold |
+| `GET /admin/quarantine` · `POST /admin/quarantine/{id}/release` | `rag:admin` | review documents the injection screen held back |
+| `GET /audit` | `rag:audit` | your tenant's audit events, paged by `after_seq` |
+
+A document you cannot manage is reported as **404, not 403**, so other people's documents are not disclosed.
 
 ---
 
@@ -577,7 +604,7 @@ BM25Retriever.retrieve(query_text, top_k=20)
     → rank-bm25 scores over in-memory corpus
     → ranked list of docs by TF-IDF-like score
 
-VectorRetriever.retrieve(query_vector, top_k=20, metadata_filter)
+VectorRetriever.retrieve(query_vector, principal, top_k=20, source_in)   # principal is mandatory
     → Qdrant ANN search (cosine similarity)
     → ranked list of docs by cosine score
 
@@ -608,6 +635,10 @@ BM25 scores and cosine similarities live on completely different scales. You can
 
 **Why `bm25_weight=0.3` and `vector_weight=0.7`?**  
 Modern embedding models are very strong at semantic matching, so they get more weight. BM25 is a useful secondary signal but shouldn't dominate.
+
+#### Entitlement filtering and the lexical branch
+
+The vector branch passes the caller's rule to Qdrant as a filter (tenant · clearance · owner/public/group · not quarantined · not superseded). The lexical branch (**BM25**) keeps **one index per tenant**, so another tenant's text can neither appear nor skew term statistics; the same rule is applied *before* ranking so `top_k` fills with permitted chunks, and every BM25 hit is re-checked against the store's *current* payload, so a revoked ACL or deleted document stops matching immediately rather than after the next index rebuild (if the store cannot be read, the lexical branch contributes nothing for that request). The index is rebuilt in a worker thread after each ingest.
 
 ---
 
@@ -649,147 +680,82 @@ If the cross-encoder model fails to load (no `sentence_transformers` installed, 
 
 ### Step 6b — Web Search Fallback
 
-**Files:** `online_pipeline/retrieval/web_search.py` (`TavilyWebSearch`), gate in `gateway._local_recall_is_weak`
+**Files:** `online_pipeline/retrieval/web_search.py` (`TavilyWebSearch`), `gateway._answer_query`
 
-The indexed corpus cannot answer everything. Local recall is judged **weak** when either:
+Two triggers: local recall is **weak** (fewer than `web_search_min_local_results` candidates, or the best cross-encoder score is below `web_search_min_relevance_score`), or after generation the answer failed grading or verification and the web has not been tried.
 
-- fewer than `web_search_min_local_results` (3) candidates came back, or
-- the best cross-encoder score is below `web_search_min_relevance_score` (0.0 logit).
-
-If the reranker is unavailable there is no absolute score, so only the count rule applies. When weak, Tavily results are normalised to the same `{text, metadata}` shape as local chunks (`file_type: web_search`, `origin: tavily`) and **reranked together with the local candidates** so both compete on one scale. Web search is skipped when there is no `TAVILY_API_KEY`, the SDK is missing, or the request sets `web_search: false`; any Tavily failure degrades to "no web results".
-
-The same helper (`_web_top_up`) is reused as a second trigger after generation grading (Step 9).
+It runs only if **tenant policy allows it AND the user holds `rag:web` AND the request did not opt out**. A blocked search that was wanted becomes a `policy.deny` audit event. When a tenant requires verified sources, Tavily is called with `include_domains` set to the verified publishers. Web hits are stamped with an explicit public-to-this-tenant ACL and a **host-based trust tier** (never anything the page claims), then reranked together with local chunks and pass through the same guard. Chat history is never sent to the web.
 
 ---
 
 ### Step 7 — Context Building
 
-**File:** `online_pipeline/context_builder/builder.py`  
-**Class:** `ContextBuilder`
+**File:** `online_pipeline/context_builder/builder.py`
 
-The reranked chunks are formatted into a human-readable (and LLM-parseable) context string.
-
-```python
-# For each chunk (up to token budget of 3000 words):
-block = f"[{i}] Source: {chunk.metadata.source}\n{chunk.text}"
-
-# Joined with:
-separator = "\n\n---\n\n"
-```
-
-Output example:
-```
-[1] Source: report_2024.pdf
-Climate change data from 2024 shows a 1.5°C increase...
-
----
-
-[2] Source: ipcc_summary.pdf
-The IPCC report concludes that human activities are the...
-```
-
-**Why number the sources `[1]`, `[2]`?**  
-The LLM system prompt instructs it to cite source numbers in the answer. This connects the answer claims back to specific chunks whose metadata is returned as `sources` in the API response. Users can verify which document each claim came from.
-
-**Why a token budget?**  
-LLMs have context window limits. Adding unlimited chunks would exceed the limit and either error out or force truncation of the question itself. The budget ensures the most relevant chunks fit within a safe window size.
+`select(chunks)` decides which chunks fit the token budget, and `build()` formats exactly those as `[1] Source: …`, `[2] …`. `select()` is the **numbering authority**: the verifier checks `[n]` against the same list, so a citation can never point at a chunk the model was not shown. Table and fact chunks are budgeted by characters (`len/3`) rather than words, because numbers tokenise badly ("391,035" is several tokens), so a table can no longer overrun the model's budget.
 
 ---
 
 ### Step 8 — LLM Answer Generation
 
-**File:** `online_pipeline/llm/llm_client.py`  
-**Class:** `LLMClient`
+**File:** `online_pipeline/llm/llm_client.py`
 
-The final step: give the LLM the question, the conversation history, and the context, and get a grounded answer.
+The prompt treats everything retrieved as **data, not instructions**:
 
-```python
-user_message = f"""
-Conversation so far:
-{history_text}
+```
+<conversation> … </conversation>
+<retrieved_context> [1] Source: … </retrieved_context>
+Latest user question: …                    (+ "Reviewer feedback: …" on a retry)
+```
 
-Context:
-[1] Source: report_2024.pdf
-Climate change data...
+The system prompt says text inside the tags may try to change the rules, reveal the prompt, call tools or emit links/images, and must never be followed; that figures must be quoted exactly with their period and units; that every statement cites `[n]`; and that derived figures must be accompanied by their inputs. Untrusted text is **defanged** before it is inserted, so a chunk containing `</retrieved_context>` cannot close the data block.
+
+Providers, routing and fallbacks are unchanged (see Step 2). `answer ONLY from context` is still the first rule: RAG is only worth anything if answers come from *your* documents.
 
 ---
 
-[2] Source: ipcc_summary.pdf
-The IPCC report...
+### Step 9 — Evaluation: grading and figure verification
 
-Latest user question: What do reports say about temperature increases?
-"""
+**Files:** `online_pipeline/grading/grader.py`, `online_pipeline/answer_safety/verify.py`
 
-system_prompt = (
-    "You are a helpful assistant. "
-    "Answer ONLY from the provided context. "
-    "If the context does not contain enough information, say so. "
-    "Cite source numbers [1], [2] where relevant."
-)
+Each draft is evaluated two ways.
 
-LLMClient(provider="groq", model="openai/gpt-oss-20b").complete(system_prompt, user_message)
+**The semantic grader** (one LLM call, JSON) returns `grounded` (every claim supported by the context) and `answers_question` (a bare "the context lacks this" does *not* answer it). It fails open: if every grader provider is down the answer is returned ungraded.
+
+**The deterministic verifier** needs no model:
+
+1. every `[n]` must exist among the chunks actually in the prompt;
+2. every sentence containing a figure must carry a citation;
+3. every figure must match a value in a **cited** chunk, scale-aware and within the precision the answer itself states (`$391.0 billion` matches 391,035 million, not 391,535);
+4. the **period** must agree (a 2023 value quoted for 2024 fails) using the table column or the XBRL period;
+5. the **currency** must agree;
+6. a stated **direction or sign** (`fell 2%`, `-2%`) must match the source's, whether the source is a table sign or prose ("declined 3%");
+7. a figure not in the sources is accepted only as a **derived** figure: a change %, difference, sum or ratio of figures in the same sentence, tolerating the rounding of those inputs (`up 2.0% from $383.3B to $391.0B`); `9.9%` for that sentence fails.
+
+Labels and trivia are ignored (years, `FY2024`, `Q3`, dates, `Item 7`, list numbers, bare small integers). An honest "I can't find that" is never penalised.
+
+```
+draft → evaluate → failing and attempts < MAX?  ──► regenerate WITH specific feedback ("the figure '$391.5 billion'
+                                                     does not appear in the cited sources …") → evaluate
+        still failing and web not tried and allowed? ──► web top-up → regenerate once → evaluate
 ```
 
-**Why `answer ONLY from context`?**  
-This prevents the LLM from hallucinating facts from its training data that aren't in the indexed documents. The RAG pattern's entire value is grounding answers in *your* documents, not general internet knowledge.
-
-**Why pass `chat_history`?**  
-Multi-turn conversations need context. Without history, a follow-up question "what about the 2023 data?" has no referent. The history is formatted as `User: ...\nAssistant: ...` blocks prepended to the context.
-
-**Provider dispatch table:**
-```python
-dispatch = {
-    "groq":      self._groq,
-    "gemini":    self._gemini,
-    "cohere":    self._cohere,
-    "mistral":   self._mistral,
-    "anthropic": self._anthropic,
-    # default:   self._openai
-}
-```
-
-Each provider method wraps the respective SDK's chat completion API. All providers receive the same `system_prompt` and `user_message`; they differ only in the SDK call structure.
+Then the tenant policy applies (see Step 10). The verifier checks **numbers, not meaning**; see [Known limitations](#known-limitations).
 
 ---
 
-### Step 9 — Generation Grading
+### Step 10 — Policy, output safety and review flag
 
-**Files:** `online_pipeline/grading/grader.py` (`GenerationGrader`, `GradeResult`), `LLMRouter.grade_answer`, loop in `gateway.query()`
+**Files:** `gateway._apply_answer_policies`, `answer_safety/sanitize.py`, `answer_safety/advice.py`
 
-Even with "answer ONLY from context" in the prompt, small models still invent details. After each draft a grader LLM (default Groq `openai/gpt-oss-20b`, temperature 0, with the usual provider fallbacks) returns one JSON verdict:
+- **Warn or abstain**, per tenant, separately for ungrounded text and for unverifiable figures. *Warn* prepends a note naming the figures; *abstain* replaces the answer with a refusal. Financial tenants default to abstain.
+- **Sanitise**: the answer never keeps a markdown image, raw HTML, a `javascript:`/`data:` URI, or a URL whose host is not one of the answer's own sources. This closes the usual way a poisoned document leaks data (an image URL carrying the secret).
+- **Investment advice** requests ("should I buy…") are declined before retrieval when the tenant policy says so. Questions *about* ratings or targets in a filing are not affected.
+- **Disclaimer** from the tenant policy is appended.
+- **`needs_review`** is true when restricted (classification ≥ 2) sources were used, a figure failed verification, or the answer was ungrounded. `warnings` lists `unverified_sources_used`, `figures_unverified`, `ungrounded`, `output_sanitized`.
+- `sources` contain only public fields (origin, trust tier, hash, period…), **never** owner, groups or tenant.
 
-```json
-{"grounded": true, "answers_question": false, "unsupported_claims": []}
-```
-
-- **grounded** — every factual claim is supported by the context (citations like `[1]` are fine; "the context does not say" is grounded).
-- **answers_question** — the answer resolves the question. An honest "I don't know" is grounded but *not* useful, which is exactly what should trigger a web search.
-
-```
-draft = generate(context)
-grade = grade(draft)
-
-while not grounded and attempts < max_generation_attempts:   # default 2 = 1 retry
-    draft = generate(context, feedback=grade.feedback())     # names the unsupported claims
-    grade = grade(draft)
-
-if not (grounded and answers_question) and web allowed and web not yet used:
-    context = rebuild(rerank(local + tavily))                # fresh evidence
-    draft = generate(context, feedback=grade.feedback())     # one last attempt
-    grade = grade(draft)
-
-if not grounded:
-    policy "warn"    → prepend "Note: parts of this answer could not be verified…"
-    policy "abstain" → replace with a refusal
-```
-
-**Why one combined grader call instead of two?** Both verdicts need the same inputs; one call halves latency and cost per attempt.
-
-**Why bounded?** The LangGraph reference loops on "not supported" indefinitely. Here the worst case is 3 generations and 3 grader calls per request.
-
-**Why fail-open?** Grading is a safety net. If every grader provider is down, `grade_answer` returns `None`, the answer is returned as-is and the response carries `grounded: null` so clients can tell it was not checked.
-
-**Cost note:** grading adds at least one extra LLM call per query. Set `ANSWER_GRADING_ENABLED=false` to turn it off.
+The audit event for the query records counts and flags (how many figures verified, which policy applied), not the figures or the text.
 
 ---
 
@@ -797,20 +763,86 @@ if not grounded:
 
 **File:** `online_pipeline/observability/tracing.py`
 
-Every pipeline stage (`query_rewrite`, `embed_query`, `hybrid_retrieve`, `rerank`, `tavily_web_search`, `build_context`, `generate_answer`, `grade_generation`) is wrapped with `@traced`, nested under one `rag_query` run. Tracing activates only when `LANGSMITH_TRACING=true` and a key is set; otherwise the decorator is a transparent no-op, so a missing `langsmith` install costs nothing. Use it to see *which* attempt the grader rejected and why.
+Every stage (`query_rewrite`, `embed_query`, `hybrid_retrieve`, `rerank`, `tavily_web_search`, `build_context`, `generate_answer`, `grade_generation`, `verify_answer`) is traced under one `rag_query` run. Tracing activates only with `LANGSMITH_TRACING=true` and a key. By default **prompts, retrieved text and answers are hidden** (`LANGSMITH_HIDE_INPUTS/OUTPUTS`), leaving names, timings and ids, because those would otherwise leave for a third party.
+
+---
+
+## Document management and lifecycle
+
+**Files:** `online_pipeline/lifecycle.py`, `scripts/backfill_acl.py`, `scripts/purge_expired.py`
+
+The API endpoints and the maintenance scripts share the same functions, so they cannot disagree.
+
+- **Change who can read a document** (`PATCH …/acl`): takes effect on the next query (the lexical branch re-checks the store). Owners can *add* only groups they belong to (groups already on the document are kept) and classify up to their own clearance; an admin may use any group; **nobody can exceed the tenant's classification ceiling**. The change is audited with before and after.
+- **Delete**: removes the chunks, and the stored original only if no other document of the tenant uses the same bytes.
+- **Legal hold**: a held document cannot be deleted by anyone, nor by the retention job.
+- **Supersession**: uploading with `supersedes=<doc_id>` hides the replaced version once the successor is live. Only the owner or an admin may supersede; a quarantined successor does not hide the old version.
+- **Retention**: `scripts/purge_expired.py --days N` (dry-run by default) deletes documents older than N days, skips held ones, never guesses at documents with no timestamp, and audits each deletion.
+- **Legacy data**: points indexed before access control have no ACL, so they are invisible to everyone. `scripts/backfill_acl.py --tenant T --owner U --apply` gives them an owner (private to that owner, internal, `unverified`); points that already have an ACL are never touched, so re-running is safe.
 
 ---
 
 ## Infrastructure Services
 
-These four services (`docker-compose.yml`) must be running before starting the API:
+`docker-compose.yml` runs the whole application (project name `production-rag`):
 
-| Service | Port | Purpose in This System |
+| Service | Host port (default) | Role |
 |---|---|---|
-| **Zookeeper** | 2181 | Kafka's metadata coordinator. Manages broker state and topic/partition metadata. Required by Kafka. |
-| **Kafka** | 9092 | The async message queue. Holds chunks between the ingestion pipeline and the embedding workers. Survives worker crashes. |
-| **Redis** | 6379 | The embedding vector cache. Prevents redundant embedding API calls. Stores vectors as JSON with a 24-hour TTL. |
-| **Qdrant** | 6333 | The vector database. Stores all embedded chunks and provides ANN (Approximate Nearest Neighbor) search. Qdrant dashboard: `http://localhost:6333/dashboard`. |
+| **api** | 8000 | the FastAPI gateway, built from `Dockerfile` (non-root, models baked in, healthcheck) |
+| **frontend** | 8080 | the UI; nginx serves the build and proxies `/query /ingest /health /admin` to `api`, so the browser only talks to one origin |
+| **qdrant** | 6333, 6334 | vector database (`/dashboard` on 6333) |
+| **redis** | 6379 | embedding cache |
+| zookeeper, kafka | 2181, 9092 | **optional**, profile `kafka`: asynchronous ingestion |
+
+Every host port is an environment variable (`API_PORT`, `FRONTEND_PORT`, `QDRANT_PORT`, …). `scripts/docker-up.sh` checks each one **before starting anything**, reports who is holding a busy port (a Docker container or a local process) and either picks the next free port (default) or stops (`--strict`). Ports held by this stack's own containers are not conflicts. Volumes: `qdrant_storage`, `audit_logs`, `hf_cache`. See the README for commands.
+
+---
+
+## Operations runbook
+
+| Task | Command |
+|---|---|
+| Start everything (checks ports) | `./scripts/docker-up.sh` (`--dev-auth` for local tokens, `--kafka` for Kafka, `--check-only` to just check ports) |
+| Mint a dev token | `docker compose exec api python scripts/make_dev_token.py --tenant dev --groups finance --clearance 3 --scopes rag:query,rag:ingest,rag:web,rag:admin` |
+| Verify the audit log was not tampered with | `python scripts/verify_audit_chain.py [path]` (exit 1 and the first bad `seq` if so) |
+| Give pre-ACL data an owner | `python scripts/backfill_acl.py --tenant legacy --owner admin@acme.com` then `--apply` |
+| Apply retention | `python scripts/purge_expired.py --days 2555` then `--apply` |
+| Review quarantined documents | `GET /admin/quarantine`, then `POST /admin/quarantine/{doc_id}/release` |
+| Edit tenant policy | edit `config/tenant_policies.yaml` (mounted into the container), restart `api` |
+
+**Okta setup.** On the Okta authorization server: set the audience (`OKTA_AUDIENCE`), define the scopes above, and add custom claims `tenant_id` (a single string), `groups` and `clearance` (an integer 0–3) to the access token. A token without a single `tenant_id` is rejected. Set `OKTA_ISSUER` to the server's https URL; keys are fetched from its JWKS endpoint.
+
+---
+
+## Known limitations
+
+These are deliberate boundaries or things not yet built, stated so nobody relies on more than is there.
+
+- **The verifier checks numbers, not meaning.** "Net sales rose 2.0% from $391.0B to $383.3B" contradicts itself, yet each figure matches a real source value, so it passes; a correct number attached to the wrong claim passes too. The semantic grader is the layer for that, and it is an LLM.
+- **No stated period means nothing to contradict**: a figure quoted without a year can match the wrong year's column.
+- **The injection screen is a heuristic.** It stops blunt attacks; the prompt delimiters, output sanitiser and quarantine are further layers, not guarantees. Text hidden by an *external* stylesheet is invisible to the HTML sanitiser.
+- **PDF tables**: ruled tables and borderless numeric statements are handled; a statement with a trailing text column (e.g. a "Status" column) is kept as prose rather than risk mis-parsing digit-heavy prose; tables that continue across pages are not merged; scanned pages get OCR text but no table structure; PDFs have no heading detection (HTML and DOCX do).
+- **Invisible-text filtering in PDFs** does not see "render mode 3" text (legitimate OCR layers use it too).
+- **The sandbox limits memory and CPU and scrubs the environment, but does not block the network** (macOS offers no simple way); it relies on the parser needing none. On macOS `RLIMIT_AS` is not enforced, so a polling watchdog backs it up.
+- **Rate limiting is in process**: with several workers the effective limit is multiplied.
+- **The BM25 index is in memory** and rebuilt after ingest; fine to tens of thousands of chunks, after which it belongs in the store as sparse vectors. Newly ingested chunks reach the lexical branch after the rebuild (the vector branch sees them at once).
+- **Audit tail truncation is not detectable** from the file alone; anchor the latest hash externally if that matters.
+- **Restricted data still goes to whichever LLM provider you configure.** Entitlement filtering does not make third-party model use acceptable for restricted classes; that needs privately hosted models and per-classification egress rules (not built).
+- **Compliance**: these are *controls* (access control, tamper-evident audit, retention, erasure, legal hold). Mapping them to FINRA/SEC/SOC 2/GDPR is for your compliance team; nothing here is a certification.
+- The UI has a token box for development; a real Okta sign-in (PKCE) flow is not included.
+- One mutation survived on this interpreter: removing the explicit IPv4-mapped-address unwrap changes nothing on Python 3.13+, whose standard library already handles it. It still matters on the Python 3.12 Docker image.
+
+---
+
+## Testing and verification
+
+`pytest tests/` runs the whole suite (about 930 tests, ~80 s; the sandbox, PDF and XML tests are the slow ones). Highlights:
+
+- **Isolation matrix**: 300 random (document, principal) pairs against Qdrant's real filter engine; the store filter and the Python guard must agree on every one.
+- **Hostile inputs** are built at test time: PDFs with JavaScript, launch actions, embedded files, a 200 MB zlib bomb, cyclic page trees; DOCX with macros, XXE, zip bombs; SSRF targets, DNS rebinding, redirect chains, gzip bombs.
+- **Sandbox mechanics**: infinite loops, memory hogs, crashes, segfaults and garbage output are all contained and reported.
+- **Backward compatibility**: documents without tables chunk byte-identically to before.
+- **Mutation checks**: for each phase a protection was deliberately broken, one at a time (≈70 mutants), and the suite had to fail. Doing this found real bugs, among them a path-traversal in the raw store (tenant id `..`), a verifier that was sign-blind, month-name matching that swallowed `decreased 1.8%`, and a "to … from" detector that could not span a decimal point.
 
 ---
 
@@ -847,3 +879,19 @@ Both the ingestion path and the query path call the same `embed_text()` function
 ### Pydantic Settings at the Root
 
 Every tunable parameter lives in `config/settings.py`. No hardcoded values exist in business logic. This means you can switch from Groq to OpenAI, change the chunk size, or swap the embedding model entirely via a single `.env` file change with zero code modifications.
+
+### Defence in depth, with two independent implementations
+
+The access rule exists as a store filter and as a Python predicate; the injection defence is a screen, a data-delimited prompt and an output sanitiser; the number check is a grader and a verifier. Each layer is allowed to be imperfect because the next one does not share its blind spot, and a disagreement between layers is itself an audited signal.
+
+### Fail closed, with one deliberate exception
+
+Unknown tenant → most restrictive policy. Missing ACL → invisible. Missing audit log → no service. Unparseable file → rejected. Unreadable store during a BM25 re-check → the lexical branch returns nothing. The one fail-*open* is the semantic grader: if every grader provider is down the answer is returned ungraded and flagged, because refusing all answers during an LLM outage is a worse failure than an unchecked one — and the deterministic verifier still runs.
+
+### Why parse in a separate process
+
+A PDF or DOCX parser is a large amount of C-adjacent code reading attacker-controlled bytes. In-process, one bad file can hang or crash the API or exhaust its memory. In a throwaway process with its own CPU/memory/time limits and no secrets in its environment, the worst case is one rejected upload.
+
+### Why store the original bytes under their hash
+
+An answer is only as trustworthy as your ability to show what it came from. The chunk carries the file's SHA-256 and the raw-store holds the file under that hash, so any figure can be traced to the exact bytes, and a retention or deletion request can remove them.

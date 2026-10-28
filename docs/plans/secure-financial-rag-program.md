@@ -1,6 +1,6 @@
 ---
 title: Secure financial RAG — access control, audit, provenance, safe ingestion, table-aware parsing, answer safety
-status: DRAFT            # v2 — awaiting approval; nothing below is implemented
+status: IMPLEMENTED      # branch feat/access-control; see "Implementation notes" at the end
 risk-tier: R4            # a defect leaks one tenant's data, ingests hostile content, or states a wrong financial figure
 size: L (program)        # ship as one branch + PR per phase
 supersedes: access-control-entitlements.md (v1)
@@ -238,3 +238,16 @@ Feature: Audit
 
 ## 8. Recommended start
 **P0 + P1** (auth, tenant policy, audit core): everything later emits audit events and consults the policy, so building them first avoids retrofitting.
+
+
+## 9. Implementation notes (what changed from the plan)
+
+All phases P0–P8 are implemented and tested on `feat/access-control`. Deviations and additions, so the plan is not mistaken for the record:
+
+- **`doc_id` includes tenant *and* owner**, not only tenant: within one tenant, a second user uploading identical bytes with a wider ACL would otherwise have overwritten the first user's ACL.
+- **BM25 became live** when `fix/rag-pipeline-defects` was merged (the gateway had never built the lexical index). It is now one index **per tenant**, filtered before ranking and re-checked against the store; this was not in the original plan because the leak did not exist until the merge.
+- **Web pages are parsed in the sandbox** (the plan only said uploads); **a borderless numeric-table detector** replaced pdfplumber's text strategy, which mis-read captions and dropped rows.
+- **Answer verification gained sign/direction checking and derived-figure tolerance** after testing showed a sign-blind comparison would verify "fell 2%" against a +2% source.
+- **Added beyond the plan:** `GET /documents`, `PATCH …/acl`, `DELETE …/documents`, `GET /audit`, supersession, `needs_review`, Docker stack with a port-checking start script, UI token box.
+- **Not built (still open):** real Okta sign-in flow in the UI (PKCE), per-classification egress rules / private model hosting, a human review queue UI, shared (Redis) rate limiting, an evaluation harness. See "Known limitations" in `ARCHITECTURE_DEEP_DIVE.md`.
+- Decisions that were assumed rather than answered (generic OIDC via Okta, one collection with a `collection_for_tenant` seam, classification 0–3, legacy data into a default-deny `legacy` tenant) were implemented as written in §0.
